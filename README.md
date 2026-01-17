@@ -13,7 +13,7 @@ Allows instant datastore operations without manual yield handling
 
 ## Initialization
 
-### Basic Implementation
+### Basic Implementation:
 
 Implementing a table that is **Sharded** and **Global** _(Not bound to a player, special functions)_
 
@@ -43,7 +43,7 @@ export type PresetOptions = {
 }
 ```
 
-### Applying Operators
+### Applying Operators:
 
 To apply changes to data in the database, you use **operators**
 
@@ -79,7 +79,7 @@ Read function for non player-bound data.
 PlayerDatastore.Read(player, "unordered_map") -- // { ["K"] = "V" }
 ```
 
-### Operators
+### Operators:
 
 All available operator types:
 
@@ -101,7 +101,7 @@ export type OperationType = {
 
 The rest of the API is self-explanatory:
 
-### Sharding (Automatically handled every operation)
+### Sharding (Automatically handled every operation):
 
 ```lua
 -- Shard(): Enables sharding for a table path (Check Config.DATASTORE.SHARD_BYTE_LIMIT)
@@ -121,7 +121,7 @@ function PlayerDatastore.Shard(player: Player, table_path: string, enable: boole
 function PlayerDatastore.ShardGlobal(path: string, enable: boolean): ()
 ```
 
-### Deletion
+### Deletion:
 
 ```lua
 -- DeletePlayerData(): Deletes a player's data
@@ -134,7 +134,7 @@ function PlayerDatastore.DeletePlayerData(player: Player): ()
 function PlayerDatastore.DeleteGlobalData(path: string): ()
 ```
 
-### Utility
+### Utility:
 
 ```lua
 -- GetPlayerData(): Gets a player's data
