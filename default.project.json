@@ -1,0 +1,12 @@
+{
+  "name": "PlayerDatastore",
+  "tree": {
+    "$className": "DataModel",
+
+    "ServerStorage": {
+      "src": {
+        "$path": "src"
+      }
+    }
+  }
+}
