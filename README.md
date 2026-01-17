@@ -1,65 +1,93 @@
-# PlayerDatastore
+# PlayerDatastore (Roblox)
 
-database that handles sharding and yielding so u can insta call functions without doing some yield bs
+A high level datastore abstraction for Roblox that handles automatic yielding, sharding, and global data.
+Allows instant datastore operations without manual yield handling
 
-also has cool api
+## Core Features
 
-## look:
+- Automatic yield handling
+- Field sharding
+- Global fields
+- Path-based table access
+- Atomic operators
+
+## Initialization
+
+### Basic Implementation
+
+Implementing a table that is **Sharded** and **Global** _(Not bound to a player, special functions)_
 
 ```lua
 PlayerDatastore.Init({
-	ServerPool = {}
+	unordered_map = {},
+
+	player_data = {
+		progression = {}
+	}
 }, {
 	ShardedFields = {
-		"ServerPool"
+		"unordered_map"
 	},
-
-    GlobalFields = {
-		"ServerPool"
+	GlobalFields = {
+		"unordered_map"
 	}
 })
 ```
 
-u can do this too:
+All available presets:
 
 ```lua
-PlayerDatastore.Init({
-	ServerPool = {
-        InnerPool = {}
-    }
-}, {
-	ShardedFields = {
-		"ServerPool.InnerPool" -- // same
-	},
-
-    GlobalFields = {
-		"ServerPool['InnerPool']" -- // same
-	}
-})
+export type PresetOptions = {
+	ShardedFields: { string }?, -- // { string }: Table Paths to be sharded
+	GlobalFields: { string }? -- // { string }: Table Paths that aren't bound per player
+}
 ```
 
-and access like:
+### Applying Operators
 
+To apply changes to data in the database, you use **operators**
 
-## add things to datastore:
+#### PlayerDatastore.ApplyOperator(player: Player, operation: Types.OperationType): ()
 
-unshards sharded fields when applying operators then reshards. if plrs leave mid operation then unsharded data thats sharded get sharded
-
-### non-global fields:
+This is for non-global fields. **When a table is sharded, it: Unshards, applies changes, then reshards. If a players leaves mid-operation, then all tables marked as sharded yet not sharded get resharded. This applies to ApplyOperatorGlobal too**
 
 ```lua
-PlayerDatastore.ApplyOperator(player, { value_name = "ServerPool", operator = "INSERT", value = { ["Key"] = 100 }})
+PlayerDatastore.ApplyOperator(player, { value_name = "player_data.progression", operator = "INSERT", value = { ["Coins"] = 500 } }) -- // "player_data.progression" can also be ("player_data['progression']" / 'player_data["progression"]')
 ```
 
-### global fields:
+#### PlayerDatastore.Read(player: Player, table_path: string): { [any]: any }?
+
+Read function for player-bound data.
 
 ```lua
-PlayerDatastore.ApplyOperatorGlobal({ value_name = "ServerPool", operator = "INSERT", value = { ["Key"] = 100 }})
+PlayerDatastore.Read(player, "player_data.progression") -- // { ["Coins"] = 500 }
 ```
 
-### types:
+#### PlayerDatastore.ApplyOperatorGlobal(operation: Types.OperationType): ()
 
-wow
+Exactly the same as **ApplyOperator** except it's not player-bound, meaning it doesn't have a player param
+
+```lua
+PlayerDatastore.ApplyOperatorGlobal({ value_name = "unordered_map", operator = "INSERT", value = { ["K"] = "V" } })
+```
+
+#### PlayerDatastore.ReadGlobal(path: string): any
+
+Read function for non player-bound data.
+
+```lua
+PlayerDatastore.Read(player, "unordered_map") -- // { ["K"] = "V" }
+```
+
+### Operators
+
+All available operator types:
+
+```lua
+export type ValueOperators = "+" | "-" | "*" | "/" | "SET" | "INSERT" | "PUSH" | "DELETE"
+```
+
+Operator structure:
 
 ```lua
 export type OperationType = {
@@ -67,87 +95,60 @@ export type OperationType = {
 	operator: ValueOperators,
 	value: any
 }
-
-export type ValueOperators = "+" | "-" | "*" | "/" | "SET" | "INSERT" | "PUSH" | "DELETE"
-
-export type PresetOptions = {
-	ShardedFields: { string }?, -- // { string }: Table Paths to be sharded
-	GlobalFields: { string }? -- // { string }: Table Paths that aren't bound per player
-}
 ```
 
-all value operators
+## API
+
+The rest of the API is self-explanatory:
+
+### Sharding (Automatically handled every operation)
 
 ```lua
-    OPERATION_CASES = {
-		["+"] = function(a: number, b: number): number return a + b end,
-		["-"] = function(a: number, b: number): number return a - b end,
-		["*"] = function(a: number, b: number): number return a * b end,
-		["/"] = function(a: number, b: number): number return a / b end,
-		["SET"] = function(a: number, b: number): number return b end,
-
-		-- @operator INSERT: Inserts a KV pair into a KV pair table
-		-- @param a: { [any]: any }
-		-- @param b: { [any]: any }
-		-- @return a
-		["INSERT"] = function(a: { [any]: any }, b: { [any]: any }): { [any]: any }
-			for k, v in b do
-				a[k] = v
-			end
-
-			return a
-		end,
-
-		-- @operator PUSH: table.insert(); Use for arrays
-		-- @param a: { any }
-		-- @param b: any
-		-- @return a
-		["PUSH"] = function(a: { any }, b: any): { any }
-			table.insert(a, b)
-
-			return a
-		end,
-
-		-- @operator DELETE: Deletes a key from a table
-		-- @param a: { [any]: any }
-		-- @param b: any
-		-- @return a
-		["DELETE"] = function(a: { [any]: any }, b: any): { [any]: any }
-			a[b] = nil
-
-			return a
-		end
-	},
+-- Shard(): Enables sharding for a table path (Check Config.DATASTORE.SHARD_BYTE_LIMIT)
+-- @param player: The player to shard
+-- @param table_path: Path to the table
+-- @param enable: Whether to enable it or not
+-- @note: Disabling while having a sharded table will result in all of the tables combining, likely leading to errors
+-- @note: The first entry will always be put, no matter how large it is, subsequent data will be sharded
+function PlayerDatastore.Shard(player: Player, table_path: string, enable: boolean): ()
 ```
 
-## utils:
+```lua
+-- ShardGlobal(): Enables sharding for a global table path
+-- @param path: The global key pointing to the table
+-- @param enable: Whether to enable sharding or not
+-- @note Automatically handles unshard + reshard
+function PlayerDatastore.ShardGlobal(path: string, enable: boolean): ()
+```
+
+### Deletion
+
+```lua
+-- DeletePlayerData(): Deletes a player's data
+-- @param player: The player to delete data for
+function PlayerDatastore.DeletePlayerData(player: Player): ()
+
+-- DeleteGlobalData(): Deletes a global data key and its shards
+-- @param path: The global key to delete
+-- @note: This almost should NEVER be used, proceed with caution
+function PlayerDatastore.DeleteGlobalData(path: string): ()
+```
+
+### Utility
 
 ```lua
 -- GetPlayerData(): Gets a player's data
 -- @param player?: The player to get data for; else returns the entire table
 -- @return { [number]: any } | any
 function PlayerDatastore.GetPlayerData(player: Player?): { [number]: any } | any
-	Config.FLAGS.PlayerDataLoaded:DeferredWait()
-
-	return if player then PlayerDatastore.PlayerData[player.UserId] else PlayerDatastore.PlayerData
-end
 
 -- GetShardData(): Gets a shard's data
 -- @param key?: Optional Key to get shard data for; else returns the entire table
 -- @return { [string]: any } | any
 function PlayerDatastore.GetShardData(key: string?): { [string]: any } | any
-	Config.FLAGS.PlayerDataLoaded:DeferredWait()
-	Config.FLAGS.GlobalDataLoaded:DeferredWait()
-
-	return if key then PlayerDatastore.ShardData[key] else PlayerDatastore.ShardData
-end
 
 -- GetGlobalData(): Gets the global data
 -- @param table_path?: The path to the table to get; else returns the entire table
 -- @return { [string]: any } | any
 function PlayerDatastore.GetGlobalData(table_path: string?): { [string]: any } | any
-	Config.FLAGS.GlobalDataLoaded:DeferredWait()
-
-	return if table_path then PlayerDatastore.GlobalData[table_path] else PlayerDatastore.GlobalData
-end
 ```

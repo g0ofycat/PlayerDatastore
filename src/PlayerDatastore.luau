@@ -668,7 +668,7 @@ end
 -- // COMPLEX OPERATIONS
 --=========================
 
--- Shard(): Enables sharding for a table path (Check Config.DATASTORE.SHARD_BYTE_LIMIT); Do not touch this if you don't know what you're doing. Yes Zeke, I am talking specifically about you                  :sob:
+-- Shard(): Enables sharding for a table path (Check Config.DATASTORE.SHARD_BYTE_LIMIT)
 -- @param player: The player to shard
 -- @param table_path: Path to the table
 -- @param enable: Whether to enable it or not
