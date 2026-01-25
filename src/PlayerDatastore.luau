@@ -27,9 +27,6 @@ local Config = require("./Config")
 -- // SIGNAL
 --=========================
 
-local Signal = require("./Utility/Signal")
-
-PlayerDatastore.Signal = Signal.new() :: Signal.Signal
 PlayerDatastore.Presets = nil :: Types.PresetOptions?
 
 --=========================
@@ -73,18 +70,26 @@ end
 -- @param schema: { [any]: any }
 -- @return { [any]: any }
 local function reconcileData(loaded: { [any]: any }, schema: { [any]: any }): { [any]: any }
-	local result = table.clone(schema)
-
-	for key, loadedValue in loaded do
-		local schemaValue = schema[key]
-
-		if typeof(loadedValue) == "table" and loadedValue.__sharded then
-			result[key] = deepClone(loadedValue)
-		elseif typeof(loadedValue) == "table" and typeof(schemaValue) == "table" then
-			result[key] = reconcileData(loadedValue, schemaValue)
-		else
-			result[key] = loadedValue
+	if typeof(schema) ~= "table" then
+		if typeof(loaded) == "table" then
+			return schema
 		end
+
+		return loaded
+	end
+
+	if typeof(loaded) ~= "table" then
+		return deepClone(schema)
+	end
+
+	if loaded.__sharded then
+		return deepClone(loaded)
+	end
+
+	local result = {}
+
+	for key, schemaValue in schema do
+		result[key] = reconcileData(loaded[key], schemaValue)
 	end
 
 	return result
@@ -95,28 +100,28 @@ end
 -- @param isBracketed: boolean
 -- @return any
 local function parseSegment(segment: string, isBracketed: boolean): any
-    if isBracketed then
-        local quoted = segment:match("^['\"](.+)['\"]$")
-        if quoted then return quoted end
+	if isBracketed then
+		local quoted = segment:match("^['\"](.+)['\"]$")
+		if quoted then return quoted end
 
-        return tonumber(segment) or segment
-    end
+		return tonumber(segment) or segment
+	end
 
-    return tonumber(segment) or segment
+	return tonumber(segment) or segment
 end
 
 -- getSegments(): Gets all segments from a path
 -- @param path: string
 -- @return { any }
 local function getSegments(path: string): { any }
-    local segments = {}
+	local segments = {}
 
-    for isBracket, content in path:gmatch("([%[%%.]?)([^%[%]%.]+)%]?") do
-        local bracketed = (isBracket == "[")
-        table.insert(segments, parseSegment(content :: string, bracketed))
-    end
+	for isBracket, content in path:gmatch("([%[%%.]?)([^%[%]%.]+)%]?") do
+		local bracketed = (isBracket == "[")
+		table.insert(segments, parseSegment(content :: string, bracketed))
+	end
 
-    return segments
+	return segments
 end
 
 -- resolvePath(): Resolves a path in a table
@@ -126,14 +131,14 @@ end
 local function resolvePath(tbl: any, path: string): any
 	local current = tbl
 
-    for _, key in getSegments(path) do
-        if type(current) ~= "table" then return nil end
+	for _, key in getSegments(path) do
+		if type(current) ~= "table" then return nil end
 
-        current = current[key]
+		current = current[key]
 		if current == nil then return nil end
-    end
+	end
 
-    return current
+	return current
 end
 
 -- setPath(): Sets a value at a path in a table
@@ -142,21 +147,21 @@ end
 -- @param value: The value to set
 local function setPath(tbl: any, path: string, value: any): ()
 	local segments = getSegments(path)
-    local current = tbl
+	local current = tbl
 
-    for i = 1, #segments do
-        local key = segments[i]
+	for i = 1, #segments do
+		local key = segments[i]
 
-        if i == #segments then
-            current[key] = value
-        else
-            if type(current[key]) ~= "table" then
-                current[key] = {}
-            end
+		if i == #segments then
+			current[key] = value
+		else
+			if type(current[key]) ~= "table" then
+				current[key] = {}
+			end
 
-            current = current[key]
-        end
-    end
+			current = current[key]
+		end
+	end
 end
 
 -- findShardedPath(): Finds the sharded path for a value
@@ -165,18 +170,18 @@ end
 -- @return string?
 local function findShardedPath(data: { [any]: any }, valueName: string): string?
 	local pathParts = string.split(valueName, ".")
-    local deepestPath: string? = nil
+	local deepestPath: string? = nil
 
-    for i = 1, #pathParts do
-        local testPath = table.concat(pathParts, ".", 1, i)
-        local testTable = resolvePath(data, testPath)
+	for i = 1, #pathParts do
+		local testPath = table.concat(pathParts, ".", 1, i)
+		local testTable = resolvePath(data, testPath)
 
-        if isSharded(testTable) then
-            deepestPath = testPath
-        end
-    end
+		if isSharded(testTable) then
+			deepestPath = testPath
+		end
+	end
 
-    return deepestPath
+	return deepestPath
 end
 
 -- saveData(): Saves the players data
@@ -191,10 +196,10 @@ local function saveData(player: Player): ()
 	for _, table_path in shardedFields do
 		local tbl = resolvePath(data, table_path)
 
-		if type(tbl) == "table" and not tbl.__sharded then
-			warn("saveData(): Force-sharding", table_path, "for", player.Name)
-			PlayerDatastore.Shard(player, table_path, true)
-		end
+		if type(tbl) ~= "table" or tbl.__sharded then continue end
+
+		warn("saveData(): Force-sharding", table_path, "for", player.Name)
+		PlayerDatastore.Shard(player, table_path, true)
 	end
 
 	pcall(function()
@@ -224,41 +229,45 @@ local function loadData(player: Player): { [any]: any }?
 	return nil
 end
 
--- saveGlobalData(): Saves a global value to the GlobalDataStore
--- @param path: The global key to save
+-- saveGlobalData(): Saves global data to the GlobalDataStore
 -- @note Automatically JSON encodes the value; reshards if needed
-local function saveGlobalData(path: string): ()
-	local tbl = PlayerDatastore.GlobalData[path]
+local function saveGlobalData(): ()
+	local globalFields: {string} = PlayerDatastore.Presets and PlayerDatastore.Presets.GlobalFields or {}
+	local dataToSave = {}
 
-	if type(tbl) == "table" then
+	for _, path in globalFields do
+		local value = PlayerDatastore.GlobalData[path]
+		if value == nil then continue end
+
+		dataToSave[path] = value
+		if type(value) ~= "table" then continue end
+
 		PlayerDatastore.ShardGlobal(path, true)
 	end
 
 	pcall(function()
-		GlobalDataStore:SetAsync(path, HttpService:JSONEncode(PlayerDatastore.GlobalData[path]))
+		GlobalDataStore:SetAsync(
+			Config.DATASTORE.GLOBAL_DATASTORE_KEY,
+			HttpService:JSONEncode(dataToSave)
+		)
 	end)
 end
 
--- loadGlobalData(): Loads a global value from the GlobalDataStore
--- @param path: The global key to load
--- @return any: The decoded value or nil if not found
-local function loadGlobalData(path: string): any
+-- loadGlobalData(): Loads global data from the GlobalDataStore
+-- @return any: Global data
+local function loadGlobalData(): any
 	local data
 
 	local success = pcall(function()
-		data = GlobalDataStore:GetAsync(path)
+		data = GlobalDataStore:GetAsync(Config.DATASTORE.GLOBAL_DATASTORE_KEY)
 	end)
 
 	if not success then
-		warn("loadGlobalData(): Failed to load global key", path)
-		return nil
+		warn("loadGlobalData(): Failed to load master global key")
+		return {}
 	end
 
-	if data then
-		return HttpService:JSONDecode(data)
-	end
-
-	return nil
+	return data and HttpService:JSONDecode(data) or {}
 end
 
 --=========================
@@ -311,15 +320,14 @@ function PlayerDatastore.Init(data_table: { [any]: any }, presets: Types.PresetO
 
 	Players.PlayerAdded:Connect(function(player)
 		local data = loadData(player)
-		local templateData = table.clone(data_table)
+		local playerTemplate = stripGlobalFields(data_table, globalFields)
 
 		local reconciled: { [any]: any }
 
 		if data then
-			reconciled = reconcileData(data, templateData)
-			reconciled = stripGlobalFields(reconciled, globalFields)
+			reconciled = reconcileData(data, playerTemplate)
 		else
-			reconciled = templateData
+			reconciled = playerTemplate
 		end
 
 		PlayerDatastore.PlayerData[player.UserId] = reconciled
@@ -356,25 +364,22 @@ function PlayerDatastore.Init(data_table: { [any]: any }, presets: Types.PresetO
 			end
 		end
 
-		PlayerDatastore.Signal:Fire(player)
 		Config.FLAGS.PlayerDataLoaded:FireDeferred()
 	end)
 
+	local globalData = loadGlobalData()
+
 	for _, table_path in globalFields do
-		local globalData = loadGlobalData(table_path)
+		local loadedValue = globalData[table_path]
+		local defaultValue = resolvePath(data_table, table_path)
 
-		if not globalData then
-			PlayerDatastore.GlobalData[table_path] = {}
+		PlayerDatastore.GlobalData[table_path] = reconcileData(loadedValue, defaultValue)
+
+		if not isSharded(PlayerDatastore.GlobalData[table_path]) then
 			continue
 		end
 
-		PlayerDatastore.GlobalData[table_path] = globalData
-
-		if not isSharded(globalData) then
-			continue
-		end
-
-		for i = 1, globalData.count do
+		for i = 1, PlayerDatastore.GlobalData[table_path].count do
 			local shardKey = getShardGlobalKey(table_path, i)
 
 			pcall(function()
@@ -417,9 +422,6 @@ function PlayerDatastore.Init(data_table: { [any]: any }, presets: Types.PresetO
 	end)
 
 	game:BindToClose(function()
-		local shardedFields: { string } = PlayerDatastore.Presets and PlayerDatastore.Presets.ShardedFields or {}
-		local globalFields: { string } = PlayerDatastore.Presets and PlayerDatastore.Presets.GlobalFields or {}
-
 		for _, player in Players:GetPlayers() do
 			local userId = player.UserId
 
@@ -447,26 +449,23 @@ function PlayerDatastore.Init(data_table: { [any]: any }, presets: Types.PresetO
 		end
 
 		for _, table_path in globalFields do
-			local tbl = resolvePath(PlayerDatastore.GlobalData, table_path)
+			local tbl = PlayerDatastore.GlobalData[table_path]
 
-			if not isSharded(tbl) then
-				saveGlobalData(table_path)
-				continue
-			end
+			if isSharded(tbl) then
+				for i = 1, tbl.count do
+					local shardKey = getShardGlobalKey(table_path, i)
+					local shardData = PlayerDatastore.ShardData[shardKey]
 
-			for i = 1, tbl.count do
-				local shardKey = getShardGlobalKey(table_path, i)
+					if not shardData then continue end
 
-				local shardData = PlayerDatastore.ShardData[shardKey]
-				if shardData then
 					pcall(function()
 						ShardedDataStore:SetAsync(shardKey, HttpService:JSONEncode(shardData))
 					end)
 				end
 			end
-
-			saveGlobalData(table_path)
 		end
+
+		saveGlobalData()
 	end)
 end
 
@@ -569,8 +568,6 @@ function PlayerDatastore.ApplyOperator(player: Player, operation: Types.Operatio
 	if shardedPath then
 		PlayerDatastore.Shard(player, shardedPath, true)
 	end
-
-	PlayerDatastore.Signal:Fire(player)
 end
 
 -- DeletePlayerData(): Deletes a player's data
@@ -584,8 +581,8 @@ function PlayerDatastore.DeletePlayerData(player: Player): ()
 	local globalFields: { string } = PlayerDatastore.Presets and PlayerDatastore.Presets.GlobalFields or {}
 
 	for _, table_path in shardedFields do
-		if table.find(globalFields, table_path) then 
-			continue 
+		if table.find(globalFields, table_path) then
+			continue
 		end
 
 		local data = PlayerDatastore.PlayerData[userId]
@@ -940,7 +937,11 @@ function PlayerDatastore.ApplyOperatorGlobal(operation: Types.OperationType): ()
 	end
 
 	if table.find(shardedFields, rootKey) then
-		PlayerDatastore.ShardGlobal(rootKey, true)
+		local currentRoot = PlayerDatastore.GlobalData[rootKey]
+
+		if typeof(currentRoot) == "table" then
+			PlayerDatastore.ShardGlobal(rootKey, true)
+		end
 	end
 
 	PlayerDatastore.GlobalLocks[rootKey] = false

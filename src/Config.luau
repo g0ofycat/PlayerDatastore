@@ -55,6 +55,7 @@ return {
 		DATASTORE_NAME = "PlayerDatastore", -- // string: Name of the datastore
 		SHARDED_DATASTORE_NAME = "ShardDatastore", -- // string: Name of the sharded datastore
 		GLOBAL_DATASTORE_NAME = "GlobalDatastore", -- // string: Name of the global datastore
+		GLOBAL_DATASTORE_KEY = "GlobalData", -- // string: Key where all global data is stored
 
 		SHARD_BYTE_LIMIT = 1000000 -- // number: Amount of bytes to intake before starting a new key; (JSON Encoded, Per Char)
 	},
