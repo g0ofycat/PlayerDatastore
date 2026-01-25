@@ -61,30 +61,6 @@ local function deepClone(tbl: { any }): any
 	return result
 end
 
--- estimateBytes(): Estimates the number of bytes a value will take in memory
--- @param value: The value to estimate
--- @return number
-local function estimateBytes(value: any): number
-	local t = typeof(value)
-
-	if t == "string" then
-		return #value
-	elseif t == "number" then
-		return 8
-	elseif t == "boolean" then
-		return 1
-	elseif t == "table" then
-		local bytes = 0
-		for k, v in value do
-			bytes += estimateBytes(k)
-			bytes += estimateBytes(v)
-		end
-		return bytes
-	else
-		return 0
-	end
-end
-
 -- isSharded(): Checks to see if a table is sharded
 -- @param tbl: { [any]: any }
 -- @return boolean
@@ -114,32 +90,50 @@ local function reconcileData(loaded: { [any]: any }, schema: { [any]: any }): { 
 	return result
 end
 
+-- parseSegment(): Parses a path segment into a key / index
+-- @param segment: string
+-- @param isBracketed: boolean
+-- @return any
+local function parseSegment(segment: string, isBracketed: boolean): any
+    if isBracketed then
+        local quoted = segment:match("^['\"](.+)['\"]$")
+        if quoted then return quoted end
+
+        return tonumber(segment) or segment
+    end
+
+    return tonumber(segment) or segment
+end
+
+-- getSegments(): Gets all segments from a path
+-- @param path: string
+-- @return { any }
+local function getSegments(path: string): { any }
+    local segments = {}
+
+    for isBracket, content in path:gmatch("([%[%%.]?)([^%[%]%.]+)%]?") do
+        local bracketed = (isBracket == "[")
+        table.insert(segments, parseSegment(content :: string, bracketed))
+    end
+
+    return segments
+end
+
 -- resolvePath(): Resolves a path in a table
 -- @param tbl: The table to resolve the path in
 -- @param path: The path to resolve
 -- @return any
 local function resolvePath(tbl: any, path: string): any
-	if not string.find(path, "%.") then
-		return tbl[path]
-	end
-
 	local current = tbl
 
-	for key in string.gmatch(path, "%[(['\"])([^'\"]+)%1%]|([^%.%[]+)") do
-		local actualKey = key:match("%[(['\"])([^'\"]+)%1%]")
+    for _, key in getSegments(path) do
+        if type(current) ~= "table" then return nil end
 
-		if not actualKey then
-			actualKey = key
-		end
+        current = current[key]
+		if current == nil then return nil end
+    end
 
-		if type(current) ~= "table" then
-			return nil
-		end
-
-		current = current[actualKey]
-	end
-
-	return current
+    return current
 end
 
 -- setPath(): Sets a value at a path in a table
@@ -147,32 +141,22 @@ end
 -- @param path: The path to set
 -- @param value: The value to set
 local function setPath(tbl: any, path: string, value: any): ()
-	if not string.find(path, "%.") then
-		tbl[path] = value
-		return
-	end
+	local segments = getSegments(path)
+    local current = tbl
 
-	local keys = {}
+    for i = 1, #segments do
+        local key = segments[i]
 
-	for match in string.gmatch(path, "%[(['\"])([^'\"]+)%1%]|([^%.%[]+)") do
-		local key = match:match("%[(['\"])([^'\"]+)%1%]") or match
+        if i == #segments then
+            current[key] = value
+        else
+            if type(current[key]) ~= "table" then
+                current[key] = {}
+            end
 
-		if key and key ~= "" then
-			table.insert(keys, key)
-		end
-	end
-
-	local current = tbl
-
-	for i = 1, #keys - 1 do
-		if type(current[keys[i]]) ~= "table" then
-			return
-		end
-
-		current = current[keys[i]]
-	end
-
-	current[keys[#keys]] = value
+            current = current[key]
+        end
+    end
 end
 
 -- findShardedPath(): Finds the sharded path for a value
@@ -181,39 +165,18 @@ end
 -- @return string?
 local function findShardedPath(data: { [any]: any }, valueName: string): string?
 	local pathParts = string.split(valueName, ".")
+    local deepestPath: string? = nil
 
-	for i = 1, #pathParts do
-		local testPath = table.concat(pathParts, ".", 1, i)
-		local testTable = resolvePath(data, testPath)
+    for i = 1, #pathParts do
+        local testPath = table.concat(pathParts, ".", 1, i)
+        local testTable = resolvePath(data, testPath)
 
-		if not isSharded(testTable) then continue end
+        if isSharded(testTable) then
+            deepestPath = testPath
+        end
+    end
 
-		return testPath
-	end
-
-	return nil
-end
-
--- loadData(): Loads the players data
--- @param player: The player to load the data for
--- @return Data?
-local function loadData<Data>(player: Player): Data?
-	local data
-
-	local success, err = pcall(function()
-		data = PlayerDataStore:GetAsync(player.UserId)
-	end)
-
-	if not success then
-		warn("loadData(): Failed to load data for", player.Name, err)
-		return
-	end
-
-	if data then
-		return HttpService:JSONDecode(data)
-	end
-
-	return nil
+    return deepestPath
 end
 
 -- saveData(): Saves the players data
@@ -229,27 +192,28 @@ local function saveData(player: Player): ()
 		local tbl = resolvePath(data, table_path)
 
 		if type(tbl) == "table" and not tbl.__sharded then
+			warn("saveData(): Force-sharding", table_path, "for", player.Name)
 			PlayerDatastore.Shard(player, table_path, true)
 		end
 	end
 
 	pcall(function()
-		PlayerDataStore:SetAsync(player.UserId, HttpService:JSONEncode(data))
+		PlayerDataStore:SetAsync(tostring(player.UserId), HttpService:JSONEncode(data))
 	end)
 end
 
--- loadGlobalData(): Loads a global value from the GlobalDataStore
--- @param path: The global key to load
--- @return any: The decoded value or nil if not found
-local function loadGlobalData(path: string): any
+-- loadData(): Loads the players data
+-- @param player: The player to load the data for
+-- @return { [any]: any }?
+local function loadData(player: Player): { [any]: any }?
 	local data
 
-	local success, err = pcall(function()
-		data = GlobalDataStore:GetAsync(path)
+	local success = pcall(function()
+		data = PlayerDataStore:GetAsync(tostring(player.UserId))
 	end)
 
 	if not success then
-		warn("loadGlobalData(): Failed to load global key", path, err)
+		warn("loadData(): Failed to load data for", player.Name)
 		return nil
 	end
 
@@ -275,6 +239,28 @@ local function saveGlobalData(path: string): ()
 	end)
 end
 
+-- loadGlobalData(): Loads a global value from the GlobalDataStore
+-- @param path: The global key to load
+-- @return any: The decoded value or nil if not found
+local function loadGlobalData(path: string): any
+	local data
+
+	local success = pcall(function()
+		data = GlobalDataStore:GetAsync(path)
+	end)
+
+	if not success then
+		warn("loadGlobalData(): Failed to load global key", path)
+		return nil
+	end
+
+	if data then
+		return HttpService:JSONDecode(data)
+	end
+
+	return nil
+end
+
 --=========================
 -- // COMPLEX PRIVATE API
 --=========================
@@ -294,13 +280,6 @@ end
 -- @return string
 local function getShardGlobalKey(path: string, index: number): string
 	return `global:{path}:shard:{index}`
-end
-
--- encodeSize(): Get JSON Encoded Size of a table
--- @param tbl: any
--- @return number
-local function encodeSize(tbl: any): number
-	return #HttpService:JSONEncode(tbl)
 end
 
 -- stripGlobalFields(): Removes from PlayerData if their name is in GlobalFields
@@ -332,15 +311,18 @@ function PlayerDatastore.Init(data_table: { [any]: any }, presets: Types.PresetO
 
 	Players.PlayerAdded:Connect(function(player)
 		local data = loadData(player)
-		local filteredData = stripGlobalFields(data_table, globalFields)
+		local templateData = table.clone(data_table)
 
-		local templateData = stripGlobalFields(data_table, globalFields)
+		local reconciled: { [any]: any }
 
 		if data then
-			PlayerDatastore.PlayerData[player.UserId] = reconcileData(data, templateData)
+			reconciled = reconcileData(data, templateData)
+			reconciled = stripGlobalFields(reconciled, globalFields)
 		else
-			PlayerDatastore.PlayerData[player.UserId] = table.clone(templateData)
+			reconciled = templateData
 		end
+
+		PlayerDatastore.PlayerData[player.UserId] = reconciled
 
 		for _, table_path in shardedFields do
 			if table.find(globalFields, table_path) then
@@ -350,6 +332,7 @@ function PlayerDatastore.Init(data_table: { [any]: any }, presets: Types.PresetO
 			local tbl = resolvePath(PlayerDatastore.PlayerData[player.UserId], table_path)
 
 			if type(tbl) ~= "table" then
+				warn("Init(): Sharded field is not a table:", table_path)
 				continue
 			end
 
@@ -495,9 +478,10 @@ function PlayerDatastore.Read(player: Player, table_path: string): { [any]: any 
 	Config.FLAGS.PlayerDataLoaded:DeferredWait()
 
 	local data = PlayerDatastore.PlayerData[player.UserId]
+
 	if not data then
 		warn("Read(): Couldn't find data for player:", player.Name)
-		return
+		return nil
 	end
 
 	local shardedPath = findShardedPath(data, table_path)
@@ -519,16 +503,16 @@ function PlayerDatastore.Read(player: Player, table_path: string): { [any]: any 
 
 		if shardedPath == table_path then
 			return combined
-		else
-			local remainingPath = string.sub(table_path, #shardedPath + 2)
-			return resolvePath(combined, remainingPath)
 		end
+
+		local remainingPath = table_path:match(
+			"^" .. shardedPath:gsub("%.", "%%.") .. "%.(.*)"
+		) or ""
+
+		return resolvePath(combined, remainingPath)
 	end
 
-	local tbl = resolvePath(data, table_path)
-	if type(tbl) ~= "table" then return end
-
-	return tbl
+	return resolvePath(data, table_path)
 end
 
 -- ApplyOperator(): Applies an operation to a player's data
@@ -566,7 +550,7 @@ function PlayerDatastore.ApplyOperator(player: Player, operation: Types.Operatio
 		setPath(data, shardedPath, combined)
 	end
 
-	local success, err = pcall(function()
+	local success = pcall(function()
 		local currentValue = resolvePath(data, operation.value_name)
 
 		if currentValue == nil then
@@ -579,8 +563,7 @@ function PlayerDatastore.ApplyOperator(player: Player, operation: Types.Operatio
 	end)
 
 	if not success then
-		warn("ApplyOperator():", err)
-		return
+		warn("ApplyOperator(): Failed to apply operation for player:", player.Name)
 	end
 
 	if shardedPath then
@@ -624,7 +607,7 @@ function PlayerDatastore.DeletePlayerData(player: Player): ()
 	end
 
 	pcall(function()
-		PlayerDataStore:RemoveAsync(userId)
+		PlayerDataStore:RemoveAsync(tostring(userId))
 	end)
 
 	PlayerDatastore.PlayerData[userId] = nil
@@ -686,41 +669,43 @@ function PlayerDatastore.Shard(player: Player, table_path: string, enable: boole
 
 	if type(tbl) ~= "table" then
 		warn("Shard(): Invalid table path")
-		return 
+		return
 	end
 
 	if enable then
 		if tbl.__sharded then
 			for i = 1, (tbl.count or 0) do
 				local shardKey = getShardKey(player.UserId, table_path, i)
+
+				pcall(function()
+					ShardedDataStore:RemoveAsync(shardKey)
+				end)
+
 				PlayerDatastore.ShardData[shardKey] = nil
 			end
 		end
 
 		local limit = Config.DATASTORE.SHARD_BYTE_LIMIT
-		local shards = {}
-		local current = {}
+		local shards: { [number]: { [any]: any } } = {}
+		local current: { [any]: any } = {}
 		local shardIndex = 1
-
 		local currentBytes = 0
 
 		for k, v in tbl do
 			if k == "__sharded" or k == "count" then continue end
 
-			local entryBytes = estimateBytes(k) + estimateBytes(v)
+			local tempForSize = { [k] = v }
+			local addedSize = #HttpService:JSONEncode(tempForSize)
 
-			if currentBytes + entryBytes > limit then
-				if next(current) then
-					shards[shardIndex] = current
-					shardIndex += 1
-				end
-
+			if currentBytes + addedSize > limit and next(current) ~= nil then
+				shards[shardIndex] = current
+				shardIndex += 1
 				current = {}
 				currentBytes = 0
 			end
 
 			current[k] = v
-			currentBytes += entryBytes
+			currentBytes += addedSize
 		end
 
 		if next(current) then
@@ -770,33 +755,36 @@ function PlayerDatastore.ShardGlobal(path: string, enable: boolean): ()
 		if tbl.__sharded then
 			for i = 1, (tbl.count or 0) do
 				local shardKey = getShardGlobalKey(path, i)
+
+				pcall(function()
+					ShardedDataStore:RemoveAsync(shardKey)
+				end)
+
 				PlayerDatastore.ShardData[shardKey] = nil
 			end
 		end
 
 		local limit = Config.DATASTORE.SHARD_BYTE_LIMIT
-		local shards = {}
-		local current = {}
+		local shards: { [number]: { [any]: any } } = {}
+		local current: { [any]: any } = {}
 		local shardIndex = 1
 		local currentBytes = 0
 
 		for k, v in PlayerDatastore.GlobalData[path] do
 			if k == "__sharded" or k == "count" then continue end
 
-			local entryBytes = estimateBytes(k) + estimateBytes(v)
+			local tempForSize = { [k] = v }
+			local addedSize = #HttpService:JSONEncode(tempForSize)
 
-			if currentBytes + entryBytes > limit then
-				if next(current) then
-					shards[shardIndex] = current
-					shardIndex += 1
-				end
-
+			if currentBytes + addedSize > limit and next(current) ~= nil then
+				shards[shardIndex] = current
+				shardIndex += 1
 				current = {}
 				currentBytes = 0
 			end
 
 			current[k] = v
-			currentBytes += entryBytes
+			currentBytes += addedSize
 		end
 
 		if next(current) then
@@ -867,15 +855,16 @@ function PlayerDatastore.ReadGlobal(path: string): any
 
 		if shardedPath == path then
 			return combined
-		else
-			local remainingPath = string.sub(path, #shardedPath + 2)
-			return resolvePath(combined, remainingPath)
 		end
+
+		local remainingPath = path:match(
+			"^" .. shardedPath:gsub("%.", "%%.") .. "%.(.*)"
+		) or ""
+
+		return resolvePath(combined, remainingPath)
 	end
 
-	local value = resolvePath(data, path)
-
-	return value
+	return resolvePath(data, path)
 end
 
 -- ApplyOperatorGlobal(): Applies an operation to a global table
@@ -935,7 +924,7 @@ function PlayerDatastore.ApplyOperatorGlobal(operation: Types.OperationType): ()
 		PlayerDatastore.GlobalData[rootKey] = combined
 	end
 
-	local success, err = pcall(function()
+	local success = pcall(function()
 		local currentValue = resolvePath(PlayerDatastore.GlobalData, operation.value_name)
 
 		if currentValue == nil then
@@ -947,9 +936,7 @@ function PlayerDatastore.ApplyOperatorGlobal(operation: Types.OperationType): ()
 	end)
 
 	if not success then
-		warn("ApplyOperatorGlobal():", err)
-		PlayerDatastore.GlobalLocks[rootKey] = false
-		return
+		warn("ApplyOperatorGlobal(): Failed to apply global operation for path:", operation.value_name)
 	end
 
 	if table.find(shardedFields, rootKey) then
