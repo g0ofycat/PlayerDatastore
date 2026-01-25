@@ -13,6 +13,7 @@ PlayerDatastore.GlobalLocks = {} :: { [string]: boolean }
 --=========================
 
 local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
 local DataStoreService = game:GetService("DataStoreService")
 local HttpService = game:GetService("HttpService")
 
@@ -20,14 +21,21 @@ local HttpService = game:GetService("HttpService")
 -- // MODULES
 --=========================
 
-local Types = require("./Types")
 local Config = require("./Config")
+
+--=========================
+-- // TYPES
+--=========================
+
+local Types = require("./Types")
+PlayerDatastore.Presets = nil :: Types.PresetOptions?
 
 --=========================
 -- // SIGNAL
 --=========================
 
-PlayerDatastore.Presets = nil :: Types.PresetOptions?
+local Signal = require("./Utility/Signal")
+PlayerDatastore.PlayerLoadedSignals = {} :: { [number]: Signal.Signal }
 
 --=========================
 -- // DATASTORE
@@ -319,6 +327,8 @@ function PlayerDatastore.Init(data_table: { [any]: any }, presets: Types.PresetO
 	local globalFields: { string } = presets.GlobalFields or {}
 
 	Players.PlayerAdded:Connect(function(player)
+		PlayerDatastore.PlayerLoadedSignals[player.UserId] = Signal.new()
+
 		local data = loadData(player)
 		local playerTemplate = stripGlobalFields(data_table, globalFields)
 
@@ -364,7 +374,7 @@ function PlayerDatastore.Init(data_table: { [any]: any }, presets: Types.PresetO
 			end
 		end
 
-		Config.FLAGS.PlayerDataLoaded:FireDeferred()
+    	PlayerDatastore.PlayerLoadedSignals[player.UserId]:FireDeferred()
 	end)
 
 	local globalData = loadGlobalData()
@@ -418,6 +428,14 @@ function PlayerDatastore.Init(data_table: { [any]: any }, presets: Types.PresetO
 		end
 
 		saveData(player)
+
+		local PlayerSignal = PlayerDatastore.PlayerLoadedSignals[player.UserId]
+
+		if PlayerSignal then
+			PlayerSignal:DisconnectAll()
+			PlayerDatastore.PlayerLoadedSignals[player.UserId] = nil
+		end
+
 		PlayerDatastore.PlayerData[player.UserId] = nil
 	end)
 
@@ -467,6 +485,8 @@ function PlayerDatastore.Init(data_table: { [any]: any }, presets: Types.PresetO
 
 		saveGlobalData()
 	end)
+
+	RunService.Heartbeat:Wait()
 end
 
 -- Read(): Reads the player's data, unshards if sharded
@@ -474,7 +494,14 @@ end
 -- @param table_path: The path to the table to read
 -- @return { [any]: any }
 function PlayerDatastore.Read(player: Player, table_path: string): { [any]: any }?
-	Config.FLAGS.PlayerDataLoaded:DeferredWait()
+	local playerSig = PlayerDatastore.PlayerLoadedSignals[player.UserId]
+
+	if playerSig then
+		playerSig:DeferredWait()
+	else
+		warn("Read(): No load signal for player", player.Name)
+		return nil
+	end
 
 	local data = PlayerDatastore.PlayerData[player.UserId]
 
@@ -518,7 +545,14 @@ end
 -- @param player: The player who is doing the operation
 -- @param operation: Types.OperationType (value_name, operator, value)
 function PlayerDatastore.ApplyOperator(player: Player, operation: Types.OperationType): ()
-	Config.FLAGS.PlayerDataLoaded:DeferredWait()
+	local playerSig = PlayerDatastore.PlayerLoadedSignals[player.UserId]
+
+	if playerSig then
+		playerSig:DeferredWait()
+	else
+		warn("ApplyOperator(): No load signal for player", player.Name)
+		return
+	end
 
 	local data = PlayerDatastore.PlayerData[player.UserId]
 
@@ -573,7 +607,14 @@ end
 -- DeletePlayerData(): Deletes a player's data
 -- @param player: The player to delete data for
 function PlayerDatastore.DeletePlayerData(player: Player): ()
-	Config.FLAGS.PlayerDataLoaded:DeferredWait()
+	local playerSig = PlayerDatastore.PlayerLoadedSignals[player.UserId]
+
+	if playerSig then
+		playerSig:DeferredWait()
+	else
+		warn("DeletePlayerData(): No load signal for player", player.Name)
+		return
+	end
 
 	local userId = player.UserId
 
@@ -952,19 +993,35 @@ end
 --=========================
 
 -- GetPlayerData(): Gets a player's data
--- @param player?: The player to get data for; else returns the entire table
--- @return { [number]: any } | any
-function PlayerDatastore.GetPlayerData(player: Player?): { [number]: any } | any
-	Config.FLAGS.PlayerDataLoaded:DeferredWait()
+-- @param player: The player to get data for
+-- @return { [any]: any }?
+function PlayerDatastore.GetPlayerData(player: Player): { [any]: any }?
+	local playerSig = PlayerDatastore.PlayerLoadedSignals[player.UserId]
 
-	return if player then PlayerDatastore.PlayerData[player.UserId] else PlayerDatastore.PlayerData
+	if playerSig then
+		playerSig:DeferredWait()
+	else
+		warn("GetPlayerData(): No load signal for player", player.Name)
+		return nil
+	end
+
+	return PlayerDatastore.PlayerData[player.UserId]
 end
 
 -- GetShardData(): Gets a shard's data
+-- @param player: The player to check the yield for
 -- @param key?: Optional Key to get shard data for; else returns the entire table
 -- @return { [string]: any } | any
-function PlayerDatastore.GetShardData(key: string?): { [string]: any } | any
-	Config.FLAGS.PlayerDataLoaded:DeferredWait()
+function PlayerDatastore.GetShardData(player: Player, key: string?): { [string]: any } | any
+	local playerSig = PlayerDatastore.PlayerLoadedSignals[player.UserId]
+
+	if playerSig then
+		playerSig:DeferredWait()
+	else
+		warn("GetShardData(): No load signal for player", player.Name)
+		return {}
+	end
+
 	Config.FLAGS.GlobalDataLoaded:DeferredWait()
 
 	return if key then PlayerDatastore.ShardData[key] else PlayerDatastore.ShardData

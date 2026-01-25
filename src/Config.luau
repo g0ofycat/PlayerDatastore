@@ -63,7 +63,6 @@ return {
 	OPERATION_CASES = OPERATION_CASES,
 
 	FLAGS = {
-		PlayerDataLoaded = Signal.new(),
 		GlobalDataLoaded = Signal.new()
 	}
 }
