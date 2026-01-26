@@ -490,6 +490,12 @@ function PlayerDatastore.Init(data_table: { [any]: any }, presets: Types.PresetO
 
 		saveShards(globalShardKeys)
 		saveGlobalData()
+
+		table.clear(PlayerDatastore.PlayerData)
+		table.clear(PlayerDatastore.ShardData)
+		table.clear(PlayerDatastore.GlobalData)
+		table.clear(PlayerDatastore.GlobalLocks)
+		table.clear(PlayerDatastore.PlayerLoadedSignals)
 	end)
 
 	RunService.Heartbeat:Wait()
