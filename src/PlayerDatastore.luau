@@ -314,6 +314,54 @@ local function stripGlobalFields(data_table: { [any]: any }, globalFields: { str
 end
 
 --=========================
+-- // PRIVATE SHARD API
+--=========================
+
+-- collectExistingShards(): Collects all existing shard keys for a user
+-- @param user_id: number
+-- @param shardedFields: { string }
+-- @param globalFields: { string }
+-- @return { string }
+local function collectExistingShards(user_id: number, shardedFields: { string }, globalFields: { string }): { string }
+    local shardKeys: { string } = {}
+
+    for _, table_path in shardedFields do
+        if table.find(globalFields, table_path) then continue end
+
+        local data = PlayerDatastore.PlayerData[user_id]
+        if not data then continue end
+
+        local tbl = resolvePath(data, table_path)
+        if not isSharded(tbl) then continue end
+
+        for i = 1, tbl.count or 0 do
+            local shardKey = getShardKey(user_id, table_path, i)
+
+            if PlayerDatastore.ShardData[shardKey] then
+                table.insert(shardKeys, shardKey)
+            end
+        end
+    end
+
+    return shardKeys
+end
+
+-- saveShards(): Saves all shards given a list of shard keys
+-- @param shardKeys: { string }
+local function saveShards(shardKeys: { string }): ()
+    for _, shardKey in shardKeys do
+        task.spawn(function()
+            local shardData = PlayerDatastore.ShardData[shardKey]
+            if not shardData then return end
+
+            pcall(function()
+                ShardedDataStore:SetAsync(shardKey, HttpService:JSONEncode(shardData))
+            end)
+        end)
+    end
+end
+
+--=========================
 -- // PUBLIC API
 --=========================
 
@@ -404,33 +452,12 @@ function PlayerDatastore.Init(data_table: { [any]: any }, presets: Types.PresetO
 	Config.FLAGS.GlobalDataLoaded:FireDeferred()
 
 	Players.PlayerRemoving:Connect(function(player)
-		for _, table_path in shardedFields do
-			if table.find(globalFields, table_path) then continue end
+		local shardKeys = collectExistingShards(player.UserId, shardedFields, globalFields)
 
-			local data = PlayerDatastore.PlayerData[player.UserId]
-			if not data then continue end
-
-			local tbl = resolvePath(data, table_path)
-			if not isSharded(tbl) then
-				continue
-			end
-
-			for i = 1, tbl.count or 0 do
-				local shardKey = getShardKey(player.UserId, table_path, i)
-
-				local shardData = PlayerDatastore.ShardData[shardKey]
-				if shardData then
-					pcall(function()
-						ShardedDataStore:SetAsync(shardKey, HttpService:JSONEncode(shardData))
-					end)
-				end
-			end
-		end
-
+		saveShards(shardKeys)
 		saveData(player)
 
 		local PlayerSignal = PlayerDatastore.PlayerLoadedSignals[player.UserId]
-
 		if PlayerSignal then
 			PlayerSignal:DisconnectAll()
 			PlayerDatastore.PlayerLoadedSignals[player.UserId] = nil
@@ -441,48 +468,27 @@ function PlayerDatastore.Init(data_table: { [any]: any }, presets: Types.PresetO
 
 	game:BindToClose(function()
 		for _, player in Players:GetPlayers() do
-			local userId = player.UserId
-
-			for _, table_path in shardedFields do
-				if table.find(globalFields, table_path) then continue end
-
-				local tbl = resolvePath(PlayerDatastore.PlayerData[userId], table_path)
-				if not isSharded(tbl) then
-					continue
-				end
-
-				for i = 1, tbl.count do
-					local shardKey = getShardKey(userId, table_path, i)
-
-					local shardData = PlayerDatastore.ShardData[shardKey]
-					if shardData then
-						pcall(function()
-							ShardedDataStore:SetAsync(shardKey, HttpService:JSONEncode(shardData))
-						end)
-					end
-				end
-			end
-
+			local shardKeys = collectExistingShards(player.UserId, shardedFields, globalFields)
+			saveShards(shardKeys)
 			saveData(player)
 		end
 
+		local globalShardKeys = {}
+
 		for _, table_path in globalFields do
 			local tbl = PlayerDatastore.GlobalData[table_path]
+			if not isSharded(tbl) then continue end
 
-			if isSharded(tbl) then
-				for i = 1, tbl.count do
-					local shardKey = getShardGlobalKey(table_path, i)
-					local shardData = PlayerDatastore.ShardData[shardKey]
+			for i = 1, tbl.count do
+				local shardKey = getShardGlobalKey(table_path, i)
 
-					if not shardData then continue end
-
-					pcall(function()
-						ShardedDataStore:SetAsync(shardKey, HttpService:JSONEncode(shardData))
-					end)
+				if PlayerDatastore.ShardData[shardKey] then
+					table.insert(globalShardKeys, shardKey)
 				end
 			end
 		end
 
+		saveShards(globalShardKeys)
 		saveGlobalData()
 	end)
 
@@ -577,7 +583,7 @@ function PlayerDatastore.ApplyOperator(player: Player, operation: Types.Operatio
 				end
 			end
 
-			PlayerDatastore.ShardData[shardKey] = nil
+			-- // PlayerDatastore.ShardData[shardKey] = nil NOTE: No removing, PlayerRemoving / BindToClose needs it to see if data is upd, then clears it
 		end
 
 		setPath(data, shardedPath, combined)
@@ -638,8 +644,6 @@ function PlayerDatastore.DeletePlayerData(player: Player): ()
 				pcall(function()
 					ShardedDataStore:RemoveAsync(shardKey)
 				end)
-
-				PlayerDatastore.ShardData[shardKey] = nil
 			end
 		end
 	end
@@ -673,8 +677,6 @@ function PlayerDatastore.DeleteGlobalData(path: string): ()
 			pcall(function()
 				ShardedDataStore:RemoveAsync(shardKey)
 			end)
-
-			PlayerDatastore.ShardData[shardKey] = nil
 		end
 	end
 
@@ -711,17 +713,11 @@ function PlayerDatastore.Shard(player: Player, table_path: string, enable: boole
 	end
 
 	if enable then
-		if tbl.__sharded then
-			for i = 1, (tbl.count or 0) do
-				local shardKey = getShardKey(player.UserId, table_path, i)
+		local oldCount = 0
 
-				pcall(function()
-					ShardedDataStore:RemoveAsync(shardKey)
-				end)
-
-				PlayerDatastore.ShardData[shardKey] = nil
-			end
-		end
+        if tbl.__sharded then
+            oldCount = tbl.count or 0
+        end
 
 		local limit = Config.DATASTORE.SHARD_BYTE_LIMIT
 		local shards: { [number]: { [any]: any } } = {}
@@ -754,6 +750,11 @@ function PlayerDatastore.Shard(player: Player, table_path: string, enable: boole
 			local shardKey = getShardKey(player.UserId, table_path, index)
 			PlayerDatastore.ShardData[shardKey] = shard
 		end
+
+		for i = shardIndex + 1, oldCount do
+            local orphanedKey = getShardKey(player.UserId, table_path, i)
+            PlayerDatastore.ShardData[orphanedKey] = nil
+        end
 
 		setPath(data, table_path, {
 			__sharded = true,
@@ -790,17 +791,11 @@ function PlayerDatastore.ShardGlobal(path: string, enable: boolean): ()
 	if type(tbl) ~= "table" then return end
 
 	if enable then
-		if tbl.__sharded then
-			for i = 1, (tbl.count or 0) do
-				local shardKey = getShardGlobalKey(path, i)
+		local oldCount = 0
 
-				pcall(function()
-					ShardedDataStore:RemoveAsync(shardKey)
-				end)
-
-				PlayerDatastore.ShardData[shardKey] = nil
-			end
-		end
+        if tbl.__sharded then
+            oldCount = tbl.count or 0
+        end
 
 		local limit = Config.DATASTORE.SHARD_BYTE_LIMIT
 		local shards: { [number]: { [any]: any } } = {}
@@ -834,6 +829,11 @@ function PlayerDatastore.ShardGlobal(path: string, enable: boolean): ()
 			PlayerDatastore.ShardData[shardKey] = shard
 		end
 
+		for i = shardIndex + 1, oldCount do
+            local orphanedKey = getShardGlobalKey(path, i)
+            PlayerDatastore.ShardData[orphanedKey] = nil
+        end
+
 		setPath(PlayerDatastore.GlobalData, path, {
 			__sharded = true,
 			count = shardIndex
@@ -854,8 +854,6 @@ function PlayerDatastore.ShardGlobal(path: string, enable: boolean): ()
 					combined[k] = v
 				end
 			end
-
-			PlayerDatastore.ShardData[shardKey] = nil
 		end
 
 		setPath(PlayerDatastore.GlobalData, path, combined)
@@ -955,8 +953,6 @@ function PlayerDatastore.ApplyOperatorGlobal(operation: Types.OperationType): ()
 					combined[k] = v
 				end
 			end
-
-			PlayerDatastore.ShardData[shardKey] = nil
 		end
 
 		PlayerDatastore.GlobalData[rootKey] = combined
