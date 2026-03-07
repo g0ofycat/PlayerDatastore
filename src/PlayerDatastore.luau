@@ -367,12 +367,12 @@ end
 
 -- Init(): Initialize the datastore handler
 -- @param data_table: { [any]: any }
--- @param presets: Types.PresetOptions
-function PlayerDatastore.Init(data_table: { [any]: any }, presets: Types.PresetOptions): ()
+-- @param presets: Types.PresetOptions?
+function PlayerDatastore.Init(data_table: { [any]: any }, presets: Types.PresetOptions?): ()
 	PlayerDatastore.Presets = presets
 
-	local shardedFields: { string } = presets.ShardedFields or {}
-	local globalFields: { string } = presets.GlobalFields or {}
+	local shardedFields: { string } = presets and presets.ShardedFields or {}
+	local globalFields: { string } = presets and presets.GlobalFields or {}
 
 	Players.PlayerAdded:Connect(function(player)
 		PlayerDatastore.PlayerLoadedSignals[player.UserId] = Signal.new()
