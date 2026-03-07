@@ -57,7 +57,10 @@ return {
 		GLOBAL_DATASTORE_NAME = "GlobalDatastore", -- // string: Name of the global datastore
 		GLOBAL_DATASTORE_KEY = "GlobalData", -- // string: Key where all global data is stored
 
-		SHARD_BYTE_LIMIT = 1000000 -- // number: Amount of bytes to intake before starting a new key; (JSON Encoded, Per Char)
+		SHARD_BYTE_LIMIT = 1000000, -- // number: Amount of bytes to intake before starting a new key; (JSON Encoded, Per Char)
+
+		AUTOSAVE_INTERVAL = 60, -- // number: Time in seconds between each autosave
+		MAX_KEYS_PER_AUTOSAVE = 50 -- // number: Max amount of keys to save per autosave
 	},
 
 	OPERATION_CASES = OPERATION_CASES,
