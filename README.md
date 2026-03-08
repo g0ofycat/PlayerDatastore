@@ -177,6 +177,7 @@ function PlayerDatastore.ShardGlobal(path: string, enable: boolean): ()
 ```lua
 -- DeletePlayerData(): Deletes a players data
 -- @param player: The player to delete data for
+-- @note: This will kick the player after deleting their data, use with caution
 function PlayerDatastore.DeletePlayerData(player: Player): ()
 ```
 

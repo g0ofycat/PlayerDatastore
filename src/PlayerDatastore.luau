@@ -241,8 +241,8 @@ end
 --=========================
 
 -- readMemoryGlobal(): Reads the global data key from MemoryStore
--- @return: { [string]: any }?
-local function readMemoryGlobal(): { [string]: any }?
+-- @return: { [string]: any }?, boolean
+local function readMemoryGlobal(): ({ [string]: any }?, boolean)
 	local data: { [string]: any }? = nil
 
 	local success = pcall(function()
@@ -251,10 +251,10 @@ local function readMemoryGlobal(): { [string]: any }?
 
 	if not success then
 		warn("readMemoryGlobal(): Failed to read from MemoryStore")
-		return nil
+		return nil, success
 	end
 
-	return data
+	return data, success
 end
 
 -- writeMemoryGlobal(): Atomically updates the global data key in MemoryStore
@@ -754,10 +754,10 @@ local function flushDirty(max_keys: number?): number
 			local Player = Players:GetPlayerByUserId(Key :: number)
 			if not Player or not PlayerDatastore.PlayerData[Key :: number] then return end
 
+			saveData(Player)
+
 			local ShardKeys = collectExistingShards(Key :: number, shardedFields, globalFields)
 			saveShards(ShardKeys)
-
-			saveData(Player)
 		end,
 
 		["string"] = function(_Key: number | string): ()
@@ -841,6 +841,51 @@ local function releaseSessionLock(user_id: number): ()
 end
 
 --=========================
+-- // PRIVATE UTILITY API
+--=========================
+
+-- readGlobalLocalFallback(): Reads global data from local cache, unsharding if needed
+-- @param path: string
+-- @return: any
+local function readGlobalLocalFallback(path: string): any
+    local shardedPath = findShardedPath(PlayerDatastore.GlobalData, path)
+    if not shardedPath then
+        return resolvePath(PlayerDatastore.GlobalData, path)
+    end
+
+    local tbl = resolvePath(PlayerDatastore.GlobalData, shardedPath)
+    local combined = {}
+
+    for i = 1, tbl.count do
+        local shardKey = getShardGlobalKey(shardedPath, i)
+        local shardData = PlayerDatastore.ShardData[shardKey]
+        if shardData then
+            for k, v in shardData do combined[k] = v end
+        end
+    end
+
+    if shardedPath == path then return combined end
+
+    local remainingPath = path:match("^" .. shardedPath:gsub("%.", "%%.") .. "%.(.*)" ) or ""
+    return resolvePath(combined, remainingPath)
+end
+
+-- cleanupLoadingState(): Cleans up the loading state for a user, resuming any threads waiting on load
+-- @param user_id: number
+local function cleanupLoadingState(user_id: number): ()
+    PlayerDatastore.LoadingPlayers[user_id] = nil
+
+    local loadQueue = PlayerDatastore.LoadingQueues[user_id]
+    if loadQueue then
+        for _, thread in loadQueue do
+            task.spawn(thread)
+        end
+
+        PlayerDatastore.LoadingQueues[user_id] = nil
+    end
+end
+
+--=========================
 -- // PRIVATE INIT API
 --=========================
 
@@ -861,7 +906,7 @@ local function onPlayerAdded(player: Player, data_table: { [any]: any }, globalF
 	if not Players:GetPlayerByUserId(player.UserId) then
 		if locked then releaseSessionLock(player.UserId) end
 		PlayerDatastore.MetaData[player.UserId] = nil
-		PlayerDatastore.LoadingPlayers[player.UserId] = nil
+		cleanupLoadingState(player.UserId)
 		return
 	end
 
@@ -875,7 +920,7 @@ local function onPlayerAdded(player: Player, data_table: { [any]: any }, globalF
 		warn("onPlayerAdded(): Failed to acquire lock for", player.Name, "- Reason:", lockReason)
 
 		PlayerDatastore.MetaData[player.UserId] = nil
-		PlayerDatastore.LoadingPlayers[player.UserId] = nil
+		cleanupLoadingState(player.UserId)
 		return
 	end
 
@@ -886,7 +931,7 @@ local function onPlayerAdded(player: Player, data_table: { [any]: any }, globalF
 		releaseSessionLock(player.UserId)
 
 		PlayerDatastore.MetaData[player.UserId] = nil
-		PlayerDatastore.LoadingPlayers[player.UserId] = nil
+		cleanupLoadingState(player.UserId)
 		return
 	end
 
@@ -908,7 +953,7 @@ local function onPlayerAdded(player: Player, data_table: { [any]: any }, globalF
 		releaseSessionLock(player.UserId)
 
 		PlayerDatastore.MetaData[player.UserId] = nil
-		PlayerDatastore.LoadingPlayers[player.UserId] = nil
+		cleanupLoadingState(player.UserId)
 		return
 	end
 
@@ -918,7 +963,7 @@ local function onPlayerAdded(player: Player, data_table: { [any]: any }, globalF
 		releaseSessionLock(player.UserId)
 
 		PlayerDatastore.MetaData[player.UserId] = nil
-		PlayerDatastore.LoadingPlayers[player.UserId] = nil
+		cleanupLoadingState(player.UserId)
 		return
 	end
 
@@ -992,7 +1037,7 @@ local function onPlayerAdded(player: Player, data_table: { [any]: any }, globalF
 		PlayerDatastore.LoadingQueues[player.UserId] = nil
 	end
 
-	PlayerDatastore.LoadingPlayers[player.UserId] = nil
+	cleanupLoadingState(player.UserId)
 end
 
 -- onGlobalSetup(): Loads and sets up everything global related
@@ -1103,36 +1148,6 @@ local function onGlobalSetup(data_table: { [any]: any }, globalFields: { string 
 end
 
 --=========================
--- // PRIVATE UTILITY API
---=========================
-
--- readGlobalLocalFallback(): Reads global data from local cache, unsharding if needed
--- @param path: string
--- @return: any
-local function readGlobalLocalFallback(path: string): any
-    local shardedPath = findShardedPath(PlayerDatastore.GlobalData, path)
-    if not shardedPath then
-        return resolvePath(PlayerDatastore.GlobalData, path)
-    end
-
-    local tbl = resolvePath(PlayerDatastore.GlobalData, shardedPath)
-    local combined = {}
-
-    for i = 1, tbl.count do
-        local shardKey = getShardGlobalKey(shardedPath, i)
-        local shardData = PlayerDatastore.ShardData[shardKey]
-        if shardData then
-            for k, v in shardData do combined[k] = v end
-        end
-    end
-
-    if shardedPath == path then return combined end
-
-    local remainingPath = path:match("^" .. shardedPath:gsub("%.", "%%.") .. "%.(.*)" ) or ""
-    return resolvePath(combined, remainingPath)
-end
-
---=========================
 -- // PUBLIC API
 --=========================
 
@@ -1161,7 +1176,7 @@ function PlayerDatastore.Init(data_table: { [any]: any }, presets: Types.PresetO
 	onGlobalSetup(data_table, globalFields, shardedFields)
 
 	Players.PlayerRemoving:Connect(function(player)
-		PlayerDatastore.LoadingPlayers[player.UserId] = nil
+		cleanupLoadingState(player.UserId)
 
 		if PlayerDatastore.DirtyData[player.UserId] then
 			local shardKeys = collectExistingShards(player.UserId :: number, shardedFields, globalFields)
@@ -1216,7 +1231,7 @@ function PlayerDatastore.Init(data_table: { [any]: any }, presets: Types.PresetO
 			end
 
 			releaseSessionLock(player.UserId)
-			PlayerDatastore.LoadingPlayers[player.UserId] = nil
+			cleanupLoadingState(player.UserId)
 
 			local queue = PlayerDatastore.OperationQueues[player.UserId]
 			if queue then
@@ -1315,6 +1330,7 @@ function PlayerDatastore.ApplyOperator(player: Player, operation: Types.Operatio
 
 	local data = PlayerDatastore.PlayerData[player.UserId]
 	if not data then
+		warn("ApplyOperator(): No data for player:", player.Name, "; Operation dropped")
 		releaseOperationLock(player.UserId)
 		return
 	end
@@ -1348,7 +1364,7 @@ function PlayerDatastore.ApplyOperator(player: Player, operation: Types.Operatio
 	end)
 
 	if not success then
-		warn("ApplyOperator(): Failed to apply operation for player:", player.Name)
+		warn("ApplyOperator(): Failed to apply operation for", player.Name)
 	end
 
 	markDirty(player.UserId)
@@ -1362,6 +1378,7 @@ end
 
 -- DeletePlayerData(): Deletes a players data
 -- @param player: The player to delete data for
+-- @note: This will kick the player after deleting their data, use with caution
 function PlayerDatastore.DeletePlayerData(player: Player): ()
 	yieldPlayerData(player.UserId)
 
@@ -1409,6 +1426,9 @@ function PlayerDatastore.DeletePlayerData(player: Player): ()
 	pcall(function()
 		PlayerMetaDataStore:RemoveAsync(getMetaKey(user_id))
 	end)
+
+	releaseSessionLock(player.UserId)
+	player:Kick("[PlayerDatastore]: Your data has been deleted. Please rejoin.")
 end
 
 -- DeleteGlobalData(): Deletes a global data key and its shards
@@ -1526,6 +1546,10 @@ function PlayerDatastore.Shard(player: Player, table_path: string, enable: boole
 		for i = shardIndex + 1, oldCount do
 			local orphanedKey = getShardKey(player.UserId, table_path, i)
 			PlayerDatastore.ShardData[orphanedKey] = nil
+
+			pcall(function()
+				ShardedDataStore:RemoveAsync(orphanedKey)
+			end)
 		end
 
 		setPath(data, table_path, {
@@ -1607,6 +1631,10 @@ function PlayerDatastore.ShardGlobal(path: string, enable: boolean): ()
 		for i = shardIndex + 1, oldCount do
 			local orphanedKey = getShardGlobalKey(path, i)
 			PlayerDatastore.ShardData[orphanedKey] = nil
+
+			pcall(function()
+				ShardedDataStore:RemoveAsync(orphanedKey)
+			end)
 		end
 
 		setPath(PlayerDatastore.GlobalData, path, {
@@ -1645,10 +1673,14 @@ end
 function PlayerDatastore.ReadGlobal(path: string): any
     yieldGlobalData()
 
-    local liveData = readMemoryGlobal()
+    local liveData, fetchOk = readMemoryGlobal()
+
+    if not fetchOk then
+        warn("ReadGlobal(): MemoryStore fetch failed, falling back to local cache")
+        return readGlobalLocalFallback(path)
+    end
 
     if not liveData then
-        warn("ReadGlobal(): Failed to read from MemoryStore, falling back to local cache")
         return readGlobalLocalFallback(path)
     end
 
@@ -1870,6 +1902,13 @@ function PlayerDatastore.RestoreSnapshot(name: string, player: Player?): ()
 			PlayerDatastore.PlayerData[user_id :: number] = deepClone(snapshot.Data)
 		else
 			setPath(data, snapshot.Path, deepClone(snapshot.Data))
+		end
+
+		local shardedFields: { string } = PlayerDatastore.Presets and PlayerDatastore.Presets.ShardedFields or {}
+		local globalFields: { string }  = PlayerDatastore.Presets and PlayerDatastore.Presets.GlobalFields or {}
+
+		if snapshot.Path ~= "" and table.find(shardedFields, snapshot.Path) and not table.find(globalFields, snapshot.Path) then
+			PlayerDatastore.Shard(player, snapshot.Path, true)
 		end
 
 		markDirty(user_id :: number | string)

@@ -8,13 +8,22 @@ local OPERATION_CASES: { [string]: (any, any) -> any } = {
 	["+"] = function(a: number, b: number): number return a + b end,
 	["-"] = function(a: number, b: number): number return a - b end,
 	["*"] = function(a: number, b: number): number return a * b end,
-	["/"] = function(a: number, b: number): number return a / b end,
+
+	["/"] = function(a: number, b: number): number
+		if b == 0 then
+			warn("OPERATION_CASES['/']: Division by zero attempted; returning 0")
+			return 0
+		end
+
+		return a / b
+	end,
+
 	["SET"] = function(a: number, b: number): number return b end,
 
 	-- @operator INSERT: Inserts a KV pair into a KV pair table
 	-- @param a: { [any]: any }
 	-- @param b: { [any]: any }
-	-- @return a
+	-- @return: a
 	["INSERT"] = function(a: { [any]: any }, b: { [any]: any }): { [any]: any }
 		for k, v in b do
 			a[k] = v
@@ -26,7 +35,7 @@ local OPERATION_CASES: { [string]: (any, any) -> any } = {
 	-- @operator PUSH: table.insert(); Use for arrays
 	-- @param a: { any }
 	-- @param b: any
-	-- @return a
+	-- @return: a
 	["PUSH"] = function(a: { any }, b: any): { any }
 		table.insert(a, b)
 
@@ -36,7 +45,7 @@ local OPERATION_CASES: { [string]: (any, any) -> any } = {
 	-- @operator DELETE: Deletes a key from a table
 	-- @param a: { [any]: any }
 	-- @param b: any
-	-- @return a
+	-- @return: a
 	["DELETE"] = function(a: { [any]: any }, b: any): { [any]: any }
 		a[b] = nil
 
