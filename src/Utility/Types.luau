@@ -23,4 +23,17 @@ export type MetaData = {
 	_SessionStart: number
 }
 
+export type SnapshotEntry = {
+	Path: string,
+	Data: { [any]: any },
+	Timestamp: number,
+	Version: string
+}
+
+export type SessionEntry = { JobID: string, Timestamp: number }
+
+export type MigrationFunction = (Data: { [any]: any }) -> { [any]: any }
+
+export type SessionLockReturnType = "OK" | "CONTESTED" | "ERROR"
+
 return nil
