@@ -616,7 +616,7 @@ local function saveGlobalData(): ()
     local globalFields: { string } = PlayerDatastore.Presets and PlayerDatastore.Presets.GlobalFields or {}
     local shardedFields: { string } = PlayerDatastore.Presets and PlayerDatastore.Presets.ShardedFields or {}
 
-    local liveData = readMemoryGlobal()
+    local liveData, _ = readMemoryGlobal()
     local dataToSave = {}
 
     for _, path in globalFields do
@@ -885,6 +885,28 @@ local function cleanupLoadingState(user_id: number): ()
     end
 end
 
+-- cleanupOperationQueues(): Resumes any threads waiting on operation locks and clears user_id in OperationQueues
+-- @param user_id: number
+local function cleanupOperationQueues(user_id: number): ()
+	local queue = PlayerDatastore.OperationQueues[user_id]
+	if not queue then return end
+
+	for _, thread in queue do
+		task.spawn(thread)
+	end
+
+	PlayerDatastore.OperationQueues[user_id] = nil
+end
+
+-- cleanupGlobalDataWaiters(): Resumes any threads waiting on global data load and clears the waiters list
+local function cleanupGlobalDataWaiters(): ()
+	for _, thread in PlayerDatastore._globalDataWaiters do
+		task.spawn(thread)
+	end
+
+	table.clear(PlayerDatastore._globalDataWaiters)
+end
+
 --=========================
 -- // PRIVATE INIT API
 --=========================
@@ -1027,16 +1049,6 @@ local function onPlayerAdded(player: Player, data_table: { [any]: any }, globalF
 		end
 	end
 
-	local loadQueue = PlayerDatastore.LoadingQueues[player.UserId]
-
-	if loadQueue then
-		for _, thread in loadQueue do
-			task.spawn(thread)
-		end
-
-		PlayerDatastore.LoadingQueues[player.UserId] = nil
-	end
-
 	cleanupLoadingState(player.UserId)
 end
 
@@ -1176,7 +1188,7 @@ function PlayerDatastore.Init(data_table: { [any]: any }, presets: Types.PresetO
 	onGlobalSetup(data_table, globalFields, shardedFields)
 
 	Players.PlayerRemoving:Connect(function(player)
-		cleanupLoadingState(player.UserId)
+		PlayerDatastore.LoadingPlayers[player.UserId] = nil
 
 		if PlayerDatastore.DirtyData[player.UserId] then
 			local shardKeys = collectExistingShards(player.UserId :: number, shardedFields, globalFields)
@@ -1193,23 +1205,8 @@ function PlayerDatastore.Init(data_table: { [any]: any }, presets: Types.PresetO
 		PlayerDatastore.PlayerData[player.UserId] = nil
 		PlayerDatastore.MetaData[player.UserId] = nil
 
-		local queue = PlayerDatastore.OperationQueues[player.UserId]
-		if queue then
-			for _, thread in queue do
-				task.spawn(thread)
-			end
-
-			PlayerDatastore.OperationQueues[player.UserId] = nil
-		end
-
-		local loadQueue = PlayerDatastore.LoadingQueues[player.UserId]
-		if loadQueue then
-			for _, thread in loadQueue do
-				task.spawn(thread)
-			end
-
-			PlayerDatastore.LoadingQueues[player.UserId] = nil
-		end
+		cleanupLoadingState(player.UserId)
+		cleanupOperationQueues(player.UserId)
 	end)
 
 	game:BindToClose(function()
@@ -1231,25 +1228,7 @@ function PlayerDatastore.Init(data_table: { [any]: any }, presets: Types.PresetO
 			end
 
 			releaseSessionLock(player.UserId)
-			cleanupLoadingState(player.UserId)
-
-			local queue = PlayerDatastore.OperationQueues[player.UserId]
-			if queue then
-				for _, thread in queue do
-					task.spawn(thread)
-				end
-
-				PlayerDatastore.OperationQueues[player.UserId] = nil
-			end
-
-			local loadQueue = PlayerDatastore.LoadingQueues[player.UserId]
-			if loadQueue then
-				for _, thread in loadQueue do
-					task.spawn(thread)
-				end
-
-				PlayerDatastore.LoadingQueues[player.UserId] = nil
-			end
+			cleanupOperationQueues(player.UserId)
 		end
 
 		if PlayerDatastore.DirtyData[Config.DATASTORE.GLOBAL_DATASTORE_KEY] then
@@ -1267,11 +1246,7 @@ function PlayerDatastore.Init(data_table: { [any]: any }, presets: Types.PresetO
 
 	PlayerDatastore._initialized = true
 
-	for _, thread in PlayerDatastore._globalDataWaiters do
-		task.spawn(thread)
-	end
-
-	table.clear(PlayerDatastore._globalDataWaiters)
+	cleanupGlobalDataWaiters()
 
 	startAutosave()
 end
@@ -1384,14 +1359,7 @@ function PlayerDatastore.DeletePlayerData(player: Player): ()
 
 	local user_id = player.UserId
 
-	local queue = PlayerDatastore.OperationQueues[user_id]
-	if queue then
-		for _, thread in queue do
-			task.spawn(thread)
-		end
-
-		PlayerDatastore.OperationQueues[user_id] = nil
-	end
+	cleanupOperationQueues(player.UserId)
 
 	local shardedFields: { string } = PlayerDatastore.Presets and PlayerDatastore.Presets.ShardedFields or {}
 	local globalFields: { string } = PlayerDatastore.Presets and PlayerDatastore.Presets.GlobalFields or {}
@@ -1848,7 +1816,7 @@ function PlayerDatastore.CreateSnapshot(name: string, path: string, player: Play
 		yieldGlobalData()
 		user_id = Config.DATASTORE.GLOBAL_DATASTORE_KEY
 
-		local liveData = readMemoryGlobal()
+		local liveData, _ = readMemoryGlobal()
 		value = if liveData then resolvePath(liveData, path) else readGlobalLocalFallback(path)
 	end
 
@@ -1928,7 +1896,7 @@ function PlayerDatastore.RestoreSnapshot(name: string, player: Player?): ()
 			return
 		end
 
-		local liveData = readMemoryGlobal()
+		local liveData, _ = readMemoryGlobal()
 		if liveData then
 			local globalFields: { string } = PlayerDatastore.Presets and PlayerDatastore.Presets.GlobalFields or {}
 			local shardedFields: { string } = PlayerDatastore.Presets and PlayerDatastore.Presets.ShardedFields or {}
@@ -2004,11 +1972,7 @@ task.delay(Config.DATASTORE.INIT_YIELD_TIME, function()
 
 	warn("PlayerDatastore: Init() was not called within INIT_YIELD_TIME; Unblocking all waiters")
 
-	for _, thread in PlayerDatastore._globalDataWaiters do
-		task.spawn(thread)
-	end
-
-	table.clear(PlayerDatastore._globalDataWaiters)
+	cleanupGlobalDataWaiters()
 end)
 
 return PlayerDatastore
