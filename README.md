@@ -1,6 +1,6 @@
 # PlayerDatastore (Roblox)
 
-A high level datastore abstraction for Roblox that handles automatic **yielding**, **sharding**, and **global data**. Allows instant datastore operations **without manual yield handling**
+A high level datastore abstraction for Roblox that handles automatic **yielding**, **sharding**, and **global data**. Allows instant datastore operations **without manual yield handling**. This DataStore also includes **Session Locking**
 
 ## Core Features
 
@@ -9,6 +9,7 @@ A high level datastore abstraction for Roblox that handles automatic **yielding*
 - Global fields
 - Path-based table access
 - Atomic operators
+- Basic Session Locking
 
 ## Initialization
 

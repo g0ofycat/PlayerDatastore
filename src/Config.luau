@@ -47,7 +47,7 @@ local OPERATION_CASES: { [string]: (any, any) -> any } = {
 }
 
 --=========================
--- // MAIN
+-- // RETURN
 --=========================
 
 return {
@@ -55,14 +55,23 @@ return {
 		DATASTORE_NAME = "PlayerDatastore", -- // string: Name of the datastore
 		SHARDED_DATASTORE_NAME = "ShardDatastore", -- // string: Name of the sharded datastore
 		GLOBAL_DATASTORE_NAME = "GlobalDatastore", -- // string: Name of the global datastore
+		GLOBAL_HASHMAP_NAME = "GlobalMemoryData", -- // string: MemoryStoreHashMap that will solve conflicts between multiple server .ApplyOperatorGlobal() calls
+		LOCK_DATASTORE_NAME = "SessionLocks", -- // string: Name of the lock datastore
+
 		GLOBAL_DATASTORE_KEY = "GlobalData", -- // string: Key where all global data is stored
+		MEMORY_STORE_KEY = "GlobalMemory", -- // string: Key for MemoryStore to solve global data conflicts
 
 		SHARD_BYTE_LIMIT = 1000000, -- // number: Amount of bytes to intake before starting a new key; (JSON Encoded, Per Char)
 
 		AUTOSAVE_INTERVAL = 60, -- // number: Time in seconds between each autosave
 		MAX_KEYS_PER_AUTOSAVE = 50, -- // number: Max amount of keys to save per autosave
 
-		SIGNAL_YIELD_TIME = 1, -- // number: Time in seconds to wait for signal to be created
+		SIGNAL_YIELD_TIME = 5, -- // number: Time in seconds to wait for signal to be created
+
+		LOCK_MAX_RETRIES = 3, -- // number: Amount of times to retry acquiring a lock before kicking the player
+		LOCK_RETRY_INTERVAL = 2, -- // number: Time in seconds between each lock retry
+
+		MEMORY_STORE_TTL = 3600 -- // number: Time in seconds for MemoryStore entries to live before expiring
 	},
 
 	OPERATION_CASES = OPERATION_CASES,

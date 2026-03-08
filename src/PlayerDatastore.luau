@@ -8,14 +8,13 @@ PlayerDatastore.GlobalData = {} :: { [string]: any }
 
 PlayerDatastore.DirtyData = {} :: { [number | string]: boolean }
 
-PlayerDatastore.GlobalLocks = {} :: { [string]: boolean }
-
 --=========================
 -- // SERVICES
 --=========================
 
 local Players = game:GetService("Players")
 local DataStoreService = game:GetService("DataStoreService")
+local MemoryStoreService = game:GetService("MemoryStoreService")
 local HttpService = game:GetService("HttpService")
 
 --=========================
@@ -45,6 +44,8 @@ PlayerDatastore.PlayerLoadedSignals = {} :: { [number]: Signal.Signal }
 local PlayerDataStore = DataStoreService:GetDataStore(Config.DATASTORE.DATASTORE_NAME)
 local ShardedDataStore = DataStoreService:GetDataStore(Config.DATASTORE.SHARDED_DATASTORE_NAME)
 local GlobalDataStore = DataStoreService:GetDataStore(Config.DATASTORE.GLOBAL_DATASTORE_NAME)
+local GlobalMemoryStore = MemoryStoreService:GetHashMap(Config.DATASTORE.GLOBAL_HASHMAP_NAME)
+local SessionLockStore = DataStoreService:GetDataStore(Config.DATASTORE.LOCK_DATASTORE_NAME)
 
 --=========================
 -- // PRIVATE API
@@ -193,6 +194,49 @@ local function findShardedPath(data: { [any]: any }, valueName: string): string?
 	return deepestPath
 end
 
+--=========================
+-- // PRIVATE MEMORY STORE API
+--=========================
+
+-- readMemoryGlobal(): Reads the global data key from MemoryStore
+-- @return: { [string]: any }?
+local function readMemoryGlobal(): { [string]: any }?
+	local data = nil
+
+	local success = pcall(function()
+		data = GlobalMemoryStore:GetAsync(Config.DATASTORE.MEMORY_STORE_KEY)
+	end)
+
+	if not success then
+		warn("readMemoryGlobal(): Failed to read from MemoryStore")
+		return nil
+	end
+
+	return data
+end
+
+-- writeMemoryGlobal(): Atomically updates the global data key in MemoryStore
+-- @param callback: (current: { [string]: any }) -> { [string]: any }: Transform function
+-- @return: boolean: Whether the write succeeded
+local function writeMemoryGlobal(callback: (current: { [string]: any }) -> { [string]: any }?): boolean
+	local success = pcall(function()
+		GlobalMemoryStore:UpdateAsync(Config.DATASTORE.MEMORY_STORE_KEY, function(current)
+			local state = current or {}
+			return callback(state)
+		end, Config.DATASTORE.MEMORY_STORE_TTL)
+	end)
+
+	if not success then
+		warn("writeMemoryGlobal(): Failed to write to MemoryStore")
+	end
+
+	return success
+end
+
+--=========================
+-- // PRIVATE SAVE / LOAD API
+--=========================
+
 -- saveData(): Saves the players data
 -- @param player: The player to save the data for
 -- @note Shards unsharded data marked as __sharded; ApplyOperator unshards to apply operations. While doing this, the player could leave, having corrupted sharded data that may exceed the 4MB Key Limit. This fixes it
@@ -241,17 +285,23 @@ end
 -- saveGlobalData(): Saves global data to the GlobalDataStore
 -- @note Automatically JSON encodes the value; reshards if needed
 local function saveGlobalData(): ()
-	local globalFields: {string} = PlayerDatastore.Presets and PlayerDatastore.Presets.GlobalFields or {}
+	local globalFields: { string } = PlayerDatastore.Presets and PlayerDatastore.Presets.GlobalFields or {}
+	local shardedFields: { string } = PlayerDatastore.Presets and PlayerDatastore.Presets.ShardedFields or {}
+
+	local liveData = readMemoryGlobal() or PlayerDatastore.GlobalData
 	local dataToSave = {}
 
 	for _, path in globalFields do
-		local value = PlayerDatastore.GlobalData[path]
+		local value = liveData[path]
 		if value == nil then continue end
 
-		dataToSave[path] = value
-		if type(value) ~= "table" then continue end
-
-		PlayerDatastore.ShardGlobal(path, true)
+		if type(value) == "table" and table.find(shardedFields, path) then
+			PlayerDatastore.GlobalData[path] = value
+			PlayerDatastore.ShardGlobal(path, true)
+			dataToSave[path] = PlayerDatastore.GlobalData[path]
+		else
+			dataToSave[path] = value
+		end
 	end
 
 	pcall(function()
@@ -362,6 +412,19 @@ local function saveShards(shardKeys: { string }): ()
 	end
 end
 
+-- saveShardsSync(): Synchronous shard save, used in BindToClose so writes finish before lock release
+-- @param shardKeys: { string }
+local function saveShardsSync(shardKeys: { string }): ()
+	for _, shardKey in shardKeys do
+		local shardData = PlayerDatastore.ShardData[shardKey]
+		if not shardData then continue end
+
+		pcall(function()
+			ShardedDataStore:SetAsync(shardKey, HttpService:JSONEncode(shardData))
+		end)
+	end
+end
+
 --=========================
 -- // PRIVATE AUTOSAVE API
 --=========================
@@ -370,27 +433,6 @@ end
 -- @param key: Player.UserId OR Config.DATASTORE.GLOBAL_DATASTORE_KEY for global data
 local function markDirty(key: number | string): ()
 	PlayerDatastore.DirtyData[key] = true
-end
-
--- saveGlobalKey(): Saves a global key
--- @param globalFields: { string }: List of global fields to check for sharding
-local function saveGlobalKey(globalFields: { string }): ()
-	local GlobalShardKeys = {}
-
-	for _, TablePath in globalFields do
-		local Tbl = PlayerDatastore.GlobalData[TablePath]
-		if not isSharded(Tbl) then continue end
-
-		for i = 1, Tbl.count do
-			local ShardKey = getShardGlobalKey(TablePath, i)
-			if not PlayerDatastore.ShardData[ShardKey] then continue end
-
-			table.insert(GlobalShardKeys, ShardKey)
-		end
-	end
-
-	saveShards(GlobalShardKeys)
-	saveGlobalData()
 end
 
 -- flushDirty(): Saves all dirty keys and clears them from DirtyData
@@ -418,7 +460,7 @@ local function flushDirty(max_keys: number?): number
 		end,
 
 		["string"] = function(_Key: number | string): ()
-			saveGlobalKey(globalFields)
+			saveGlobalData()
 		end
 	}
 
@@ -441,6 +483,59 @@ local function startAutosave(): ()
 			local flushed = flushDirty(Config.DATASTORE.MAX_KEYS_PER_AUTOSAVE)
 			print(`startAutosave(): Flushed {flushed} keys`)
 		end
+	end)
+end
+
+--=========================
+-- // PRIVATE SESSION LOCK API
+--=========================
+
+-- getSessionLockKey(): Returns the session lock key for a given user_id
+-- @param user_id: number
+-- @return: string
+local function getSessionLockKey(user_id: number): string
+	return `session:{user_id}:lock`
+end
+
+-- acquireSessionLock(): Atomically acquires a session lock for a player
+-- @param user_id: number
+-- @return: boolean: Whether the lock was acquired
+local function acquireSessionLock(user_id: number): boolean
+	local lockKey = getSessionLockKey(user_id)
+	local acquired = false
+
+	for attempt = 1, Config.DATASTORE.LOCK_MAX_RETRIES do
+		local success = pcall(function()
+			SessionLockStore:UpdateAsync(lockKey, function(existingLock): string?
+				if existingLock and existingLock ~= game.JobId then
+					return nil
+				end
+
+				acquired = true
+
+				return game.JobId
+			end)
+		end)
+
+		if success and acquired then
+			return true
+		end
+
+		if success and not acquired then
+			return false
+		end
+
+		task.wait(Config.DATASTORE.LOCK_RETRY_INTERVAL)
+	end
+
+	return false
+end
+
+-- releaseSessionLock(): Releases the session lock for a player
+-- @param user_id: number
+local function releaseSessionLock(user_id: number): ()
+	pcall(function()
+		SessionLockStore:RemoveAsync(getSessionLockKey(user_id))
 	end)
 end
 
@@ -477,9 +572,19 @@ end
 local function onPlayerAdded(player: Player, data_table: { [any]: any }, globalFields: { string }, shardedFields: { string }): ()
 	PlayerDatastore.PlayerLoadedSignals[player.UserId] = Signal.new()
 
+	local locked = acquireSessionLock(player.UserId)
+	if not locked then
+		warn("onPlayerAdded(): Session lock held by another server, kicking:", player.Name)
+
+		player:Kick("[PlayerDatastore]: Your data is still being saved from another server. Please rejoin in a moment.")
+		PlayerDatastore.PlayerLoadedSignals[player.UserId]:FireDeferred()
+		PlayerDatastore.PlayerLoadedSignals[player.UserId] = nil
+
+		return
+	end
+
 	local data = loadData(player)
 	local playerTemplate = stripGlobalFields(data_table, globalFields)
-
 	local reconciled: { [any]: any }
 
 	if data then
@@ -491,19 +596,17 @@ local function onPlayerAdded(player: Player, data_table: { [any]: any }, globalF
 	PlayerDatastore.PlayerData[player.UserId] = reconciled
 
 	for _, table_path in shardedFields do
-		if table.find(globalFields, table_path) then
-			continue
-		end
+		if table.find(globalFields, table_path) then continue end
 
 		local tbl = resolvePath(PlayerDatastore.PlayerData[player.UserId], table_path)
 
 		if tbl == nil then
-			warn("Init(): Sharded field not found in data template:", table_path)
+			warn("onPlayerAdded(): Sharded field not found in data template:", table_path)
 			continue
 		end
 
 		if type(tbl) ~= "table" then
-			warn("Init(): Sharded field is not a table:", table_path)
+			warn("onPlayerAdded(): Sharded field is not a table:", table_path)
 			continue
 		end
 
@@ -552,6 +655,7 @@ function PlayerDatastore.Init(data_table: { [any]: any }, presets: Types.PresetO
 	end
 
 	local globalData = loadGlobalData()
+	local globalMemoryState = {}
 
 	for _, table_path in globalFields do
 		local loadedValue = globalData[table_path]
@@ -562,36 +666,49 @@ function PlayerDatastore.Init(data_table: { [any]: any }, presets: Types.PresetO
 			continue
 		end
 
+		local reconciled: { [any]: any } = {}
+
 		if type(loadedValue) == "table" and loadedValue.__sharded then
-			PlayerDatastore.GlobalData[table_path] = {
-				__sharded = true,
-				count = loadedValue.count or 0
-			}
+			local combined = {}
+
+			for i = 1, loadedValue.count or 0 do
+				local shardKey = getShardGlobalKey(table_path, i)
+
+				pcall(function()
+					local shardData = ShardedDataStore:GetAsync(shardKey)
+					if not shardData then return end
+
+					local decoded = HttpService:JSONDecode(shardData)
+					for k, v in decoded do
+						combined[k] = v
+					end
+				end)
+			end
+
+			reconciled = combined
 		else
-			PlayerDatastore.GlobalData[table_path] = reconcileData(loadedValue, defaultValue)
+			reconciled = reconcileData(loadedValue, defaultValue)
 		end
 
-		local tbl = PlayerDatastore.GlobalData[table_path]
+		PlayerDatastore.GlobalData[table_path] = reconciled
+		globalMemoryState[table_path] = reconciled
+	end
 
-		if not table.find(shardedFields, table_path) then continue end
+	local existingMemory = readMemoryGlobal()
 
-		if not isSharded(tbl) then
-			PlayerDatastore.GlobalData[table_path] = {
-				__sharded = true,
-				count = 0
-			}
-			continue
+	if not existingMemory then
+		local written = writeMemoryGlobal(function()
+			return globalMemoryState
+		end)
+
+		if not written then
+			warn("Init(): Failed to seed MemoryStore with global data")
 		end
+	else
+		for _, table_path in globalFields do
+			if existingMemory[table_path] == nil then continue end
 
-		for i = 1, tbl.count do
-			local shardKey = getShardGlobalKey(table_path, i)
-
-			pcall(function()
-				local shardData = ShardedDataStore:GetAsync(shardKey)
-				if not shardData then return end
-
-				PlayerDatastore.ShardData[shardKey] = HttpService:JSONDecode(shardData)
-			end)
+			PlayerDatastore.GlobalData[table_path] = existingMemory[table_path]
 		end
 	end
 
@@ -606,6 +723,8 @@ function PlayerDatastore.Init(data_table: { [any]: any }, presets: Types.PresetO
 			PlayerDatastore.DirtyData[player.UserId] = nil
 		end
 
+		releaseSessionLock(player.UserId)
+
 		local PlayerSignal = PlayerDatastore.PlayerLoadedSignals[player.UserId]
 
 		if PlayerSignal then
@@ -618,40 +737,25 @@ function PlayerDatastore.Init(data_table: { [any]: any }, presets: Types.PresetO
 
 	game:BindToClose(function()
 		for _, player in Players:GetPlayers() do
-			if not PlayerDatastore.DirtyData[player.UserId] then continue end
+			if PlayerDatastore.DirtyData[player.UserId] then
+				local shardKeys = collectExistingShards(player.UserId, shardedFields, globalFields)
+				saveShardsSync(shardKeys)
+				saveData(player)
 
-			local shardKeys = collectExistingShards(player.UserId, shardedFields, globalFields)
-			saveShards(shardKeys)
-			saveData(player)
+				PlayerDatastore.DirtyData[player.UserId] = nil
+			end
 
-			PlayerDatastore.DirtyData[player.UserId] = nil
+			releaseSessionLock(player.UserId)
 		end
 
 		if PlayerDatastore.DirtyData[Config.DATASTORE.GLOBAL_DATASTORE_KEY] then
-			local globalShardKeys = {}
-
-			for _, table_path in globalFields do
-				local tbl = PlayerDatastore.GlobalData[table_path]
-				if not isSharded(tbl) then continue end
-
-				for i = 1, tbl.count do
-					local shardKey = getShardGlobalKey(table_path, i)
-					if not PlayerDatastore.ShardData[shardKey] then continue end
-
-					table.insert(globalShardKeys, shardKey)
-				end
-			end
-
-			saveShards(globalShardKeys)
 			saveGlobalData()
-
 			PlayerDatastore.DirtyData[Config.DATASTORE.GLOBAL_DATASTORE_KEY] = nil
 		end
 
 		table.clear(PlayerDatastore.PlayerData)
 		table.clear(PlayerDatastore.ShardData)
 		table.clear(PlayerDatastore.GlobalData)
-		table.clear(PlayerDatastore.GlobalLocks)
 		table.clear(PlayerDatastore.PlayerLoadedSignals)
 	end)
 
@@ -851,6 +955,11 @@ function PlayerDatastore.DeleteGlobalData(path: string): ()
 
 	PlayerDatastore.GlobalData[path] = nil
 
+	writeMemoryGlobal(function(current): { [string]: any }
+		current[path] = nil
+		return current
+	end)
+
 	pcall(function()
 		GlobalDataStore:SetAsync(
 			Config.DATASTORE.GLOBAL_DATASTORE_KEY,
@@ -1042,37 +1151,14 @@ end
 function PlayerDatastore.ReadGlobal(path: string): any
 	Config.FLAGS.GlobalDataLoaded:DeferredWait()
 
-	local data = PlayerDatastore.GlobalData
+	local liveData = readMemoryGlobal()
 
-	local shardedPath = findShardedPath(data, path)
-
-	if shardedPath then
-		local shardedTable = resolvePath(data, shardedPath)
-		local combined = {}
-
-		for i = 1, shardedTable.count do
-			local shardKey = getShardGlobalKey(shardedPath, i)
-			local shardData = PlayerDatastore.ShardData[shardKey]
-
-			if shardData then
-				for k, v in shardData do
-					combined[k] = v
-				end
-			end
-		end
-
-		if shardedPath == path then
-			return combined
-		end
-
-		local remainingPath = path:match(
-			"^" .. shardedPath:gsub("%.", "%%.") .. "%.(.*)"
-		) or ""
-
-		return resolvePath(combined, remainingPath)
+	if not liveData then
+		warn("ReadGlobal(): Failed to read from MemoryStore, falling back to local cache")
+		return resolvePath(PlayerDatastore.GlobalData, path)
 	end
 
-	return resolvePath(data, path)
+	return resolvePath(liveData, path)
 end
 
 -- ApplyOperatorGlobal(): Applies an operation to a global table
@@ -1080,80 +1166,42 @@ end
 function PlayerDatastore.ApplyOperatorGlobal(operation: Types.OperationType): ()
 	Config.FLAGS.GlobalDataLoaded:DeferredWait()
 
-	local shardedFields: { string } = PlayerDatastore.Presets and PlayerDatastore.Presets.ShardedFields or {}
 	local globalFields: { string } = PlayerDatastore.Presets and PlayerDatastore.Presets.GlobalFields or {}
-
-	if not PlayerDatastore.GlobalData then
-		warn("ApplyOperatorGlobal(): GlobalData not initialized")
-		return
-	end
-
-	local rootKey = nil
 	local pathParts = string.split(operation.value_name, ".")
 
-	if table.find(globalFields, pathParts[1]) then
-		rootKey = pathParts[1]
-	else
+	if not table.find(globalFields, pathParts[1]) then
 		warn("ApplyOperatorGlobal(): Path doesn't start with a valid global field:", operation.value_name)
 		return
 	end
 
-	if PlayerDatastore.GlobalLocks[rootKey] then
-		warn("ApplyOperatorGlobal(): Operation already in progress for", rootKey)
-		return
-	end
+	local liveData: { [string]: any }? = nil
 
-	PlayerDatastore.GlobalLocks[rootKey] = true
-
-	local rootTable = PlayerDatastore.GlobalData[rootKey]
-
-	if not rootTable then
-		warn("ApplyOperatorGlobal(): Root global key not found:", rootKey)
-		PlayerDatastore.GlobalLocks[rootKey] = false
-		return
-	end
-
-	if isSharded(rootTable) then
-		local combined = {}
-
-		for i = 1, rootTable.count do
-			local shardKey = getShardGlobalKey(rootKey, i)
-			local shardData = PlayerDatastore.ShardData[shardKey]
-
-			if shardData then
-				for k, v in shardData do
-					combined[k] = v
-				end
-			end
-		end
-
-		PlayerDatastore.GlobalData[rootKey] = combined
-	end
-
-	local success = pcall(function()
-		local currentValue = resolvePath(PlayerDatastore.GlobalData, operation.value_name)
+	local success = writeMemoryGlobal(function(current): { [string]: any }?
+		local currentValue = resolvePath(current, operation.value_name)
 
 		if currentValue == nil then
-			error(`ApplyOperatorGlobal(): Couldn't find value: {operation.value_name}`)
+			warn("ApplyOperatorGlobal(): Couldn't find value:", operation.value_name)
+			return nil
 		end
 
 		local newValue = Config.OPERATION_CASES[operation.operator](currentValue, operation.value)
-		setPath(PlayerDatastore.GlobalData, operation.value_name, newValue)
+		setPath(current, operation.value_name, newValue)
+
+		liveData = current
+
+		return current
 	end)
 
 	if not success then
 		warn("ApplyOperatorGlobal(): Failed to apply global operation for path:", operation.value_name)
+		return
 	end
 
-	if table.find(shardedFields, rootKey) then
-		local currentRoot = PlayerDatastore.GlobalData[rootKey]
-
-		if typeof(currentRoot) == "table" then
-			PlayerDatastore.ShardGlobal(rootKey, true)
+	if liveData then
+		for _, table_path in globalFields do
+			PlayerDatastore.GlobalData[table_path] = liveData[table_path]
 		end
 	end
-
-	PlayerDatastore.GlobalLocks[rootKey] = false
 
 	markDirty(Config.DATASTORE.GLOBAL_DATASTORE_KEY)
 end
@@ -1203,7 +1251,14 @@ end
 function PlayerDatastore.GetGlobalData(table_path: string?): { [string]: any } | any
 	Config.FLAGS.GlobalDataLoaded:DeferredWait()
 
-	return if table_path then PlayerDatastore.GlobalData[table_path] else PlayerDatastore.GlobalData
+	local liveData = readMemoryGlobal()
+
+	if not liveData then
+		warn("GetGlobalData(): Failed to read from MemoryStore, falling back to local cache")
+		return if table_path then PlayerDatastore.GlobalData[table_path] else PlayerDatastore.GlobalData
+	end
+
+	return if table_path then liveData[table_path] else liveData
 end
 
 return PlayerDatastore
