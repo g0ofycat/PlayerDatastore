@@ -13,4 +13,14 @@ export type PresetOptions = {
 	GlobalFields: { string }? -- // { string }: Table Paths that aren't bound per player
 }
 
+export type MetaData = {
+	LastSaved: number,
+	ServerId: string,
+	SaveCount: number,
+	FirstJoined: number,
+	TotalPlaytime: number,
+	DataVersion: string,
+	_SessionStart: number
+}
+
 return nil

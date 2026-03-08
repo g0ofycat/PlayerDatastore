@@ -8,6 +8,8 @@ PlayerDatastore.GlobalData = {} :: { [string]: any }
 
 PlayerDatastore.DirtyData = {} :: { [number | string]: boolean }
 
+PlayerDatastore.CurrentVersion = "v.1.0.0"
+
 --=========================
 -- // SERVICES
 --=========================
@@ -28,6 +30,8 @@ local Config = require("./Config")
 --=========================
 
 local Types = require("./Types")
+
+PlayerDatastore.MetaData = {} :: { [number | string]: Types.MetaData }
 PlayerDatastore.Presets = nil :: Types.PresetOptions?
 
 --=========================
@@ -35,6 +39,7 @@ PlayerDatastore.Presets = nil :: Types.PresetOptions?
 --=========================
 
 local Signal = require("./Utility/Signal")
+
 PlayerDatastore.PlayerLoadedSignals = {} :: { [number]: Signal.Signal }
 
 --=========================
@@ -44,6 +49,7 @@ PlayerDatastore.PlayerLoadedSignals = {} :: { [number]: Signal.Signal }
 local PlayerDataStore = DataStoreService:GetDataStore(Config.DATASTORE.DATASTORE_NAME)
 local ShardedDataStore = DataStoreService:GetDataStore(Config.DATASTORE.SHARDED_DATASTORE_NAME)
 local GlobalDataStore = DataStoreService:GetDataStore(Config.DATASTORE.GLOBAL_DATASTORE_NAME)
+local PlayerMetaDataStore = DataStoreService:GetDataStore(Config.DATASTORE.PLAYER_METADATA_STORE_NAME)
 local SessionLockStore = DataStoreService:GetDataStore(Config.DATASTORE.LOCK_DATASTORE_NAME)
 
 local GlobalMemoryStore = MemoryStoreService:GetHashMap(Config.DATASTORE.GLOBAL_HASHMAP_NAME)
@@ -235,6 +241,82 @@ local function writeMemoryGlobal(callback: (current: { [string]: any }) -> { [st
 end
 
 --=========================
+-- // PRIVATE METADATA API
+--=========================
+
+-- getMetaKey(): Returns the metadata key for a given userId
+-- @param userId: number
+-- @return: string
+local function getMetaKey(userId: number): string
+	return `meta:{userId}`
+end
+
+-- loadMetaData(): Loads metadata for a player
+-- @param player: Player
+-- @return: MetaData?
+local function loadMetaData(player: Player): Types.MetaData?
+	local data: string? = nil
+
+	local success = pcall(function()
+		data = PlayerMetaDataStore:GetAsync(getMetaKey(player.UserId))
+	end)
+
+	if not success then
+		warn("loadMetaData(): Failed to load metadata for", player.Name)
+		return nil
+	end
+
+	return data and HttpService:JSONDecode(data) or nil
+end
+
+-- saveMetaData(): Saves metadata for a player
+-- @param player: Player
+local function saveMetaData(player: Player): ()
+	local existing = PlayerDatastore.MetaData[player.UserId]
+	if not existing then return end
+
+	local updated: Types.MetaData = {
+		LastSaved = os.time(),
+		ServerId = game.JobId,
+		SaveCount = existing.SaveCount + 1,
+		FirstJoined = existing.FirstJoined,
+		TotalPlaytime = existing.TotalPlaytime + (os.time() - (existing._SessionStart or os.time())),
+		DataVersion = PlayerDatastore.CurrentVersion,
+		_SessionStart = existing._SessionStart
+	}
+
+	PlayerDatastore.MetaData[player.UserId] = updated
+
+	pcall(function()
+		PlayerMetaDataStore:SetAsync(getMetaKey(player.UserId), HttpService:JSONEncode(updated))
+	end)
+end
+
+-- saveGlobalMetaData(): Saves global metadata
+local function saveGlobalMetaData(): ()
+	local existing = PlayerDatastore.MetaData[Config.DATASTORE.GLOBAL_DATASTORE_KEY]
+
+	local meta: Types.MetaData = {
+		LastSaved = os.time(),
+		ServerId = game.JobId,
+		SaveCount = (existing and existing.SaveCount or 0) + 1,
+		FirstJoined = existing and existing.FirstJoined or os.time(),
+		TotalPlaytime = 0,
+		DataVersion = PlayerDatastore.CurrentVersion,
+		_SessionStart = 0
+	}
+
+	PlayerDatastore.MetaData[Config.DATASTORE.GLOBAL_DATASTORE_KEY] = meta
+
+	pcall(function()
+		GlobalDataStore:SetAsync(
+			`{Config.DATASTORE.GLOBAL_DATASTORE_KEY}:meta`,
+			HttpService:JSONEncode(meta)
+		)
+	end)
+end
+
+--=========================
 -- // PRIVATE SAVE / LOAD API
 --=========================
 
@@ -259,6 +341,8 @@ local function saveData(player: Player): ()
 	pcall(function()
 		PlayerDataStore:SetAsync(tostring(player.UserId), HttpService:JSONEncode(data))
 	end)
+
+	saveMetaData(player)
 end
 
 -- loadData(): Loads the players data
@@ -311,6 +395,8 @@ local function saveGlobalData(): ()
 			HttpService:JSONEncode(dataToSave)
 		)
 	end)
+
+	saveGlobalMetaData()
 end
 
 -- loadGlobalData(): Loads global data from the GlobalDataStore
@@ -583,6 +669,18 @@ local function onPlayerAdded(player: Player, data_table: { [any]: any }, globalF
 		return
 	end
 
+	local loadedMeta = loadMetaData(player)
+
+	PlayerDatastore.MetaData[player.UserId] = {
+		LastSaved = loadedMeta and loadedMeta.LastSaved or os.time(),
+		ServerId = game.JobId,
+		SaveCount = loadedMeta and loadedMeta.SaveCount or 0,
+		FirstJoined = loadedMeta and loadedMeta.FirstJoined or os.time(),
+		TotalPlaytime = loadedMeta and loadedMeta.TotalPlaytime or 0,
+		DataVersion = PlayerDatastore.CurrentVersion,
+		_SessionStart = os.time()
+	}
+
 	local data = loadData(player)
 	local playerTemplate = stripGlobalFields(data_table, globalFields)
 	local reconciled: { [any]: any }
@@ -733,6 +831,7 @@ function PlayerDatastore.Init(data_table: { [any]: any }, presets: Types.PresetO
 		end
 
 		PlayerDatastore.PlayerData[player.UserId] = nil
+		PlayerDatastore.MetaData[player.UserId] = nil
 	end)
 
 	game:BindToClose(function()
@@ -756,6 +855,7 @@ function PlayerDatastore.Init(data_table: { [any]: any }, presets: Types.PresetO
 		table.clear(PlayerDatastore.PlayerData)
 		table.clear(PlayerDatastore.ShardData)
 		table.clear(PlayerDatastore.GlobalData)
+		table.clear(PlayerDatastore.MetaData)
 		table.clear(PlayerDatastore.PlayerLoadedSignals)
 	end)
 
@@ -1259,6 +1359,42 @@ function PlayerDatastore.GetGlobalData(table_path: string?): { [string]: any } |
 	end
 
 	return if table_path then liveData[table_path] else liveData
+end
+
+--=========================
+-- // VERSIONING API
+--=========================
+
+-- ChangeVersion(): Changes the current version
+-- @param new_version: The new version to set (default: "v.1.0.0")
+function PlayerDatastore.ChangeVersion(new_version: string): ()
+	PlayerDatastore.CurrentVersion = new_version
+end
+
+--=========================
+-- // METADATA API
+--=========================
+
+-- GetMetaData(): Gets metadata for a player or global data
+-- @param player?: The player to get metadata for; if nil returns global metadata
+-- @return: Types.MetaData?
+function PlayerDatastore.GetMetaData(player: Player?): Types.MetaData?
+	if player then
+		local playerSig = waitForSignal(player.UserId, Config.DATASTORE.SIGNAL_YIELD_TIME)
+
+		if not playerSig then
+			warn("GetMetaData(): Timed out waiting for load signal:", player.Name)
+			return nil
+		end
+
+		playerSig:DeferredWait()
+
+		return PlayerDatastore.MetaData[player.UserId]
+	end
+
+	Config.FLAGS.GlobalDataLoaded:DeferredWait()
+
+	return PlayerDatastore.MetaData[Config.DATASTORE.GLOBAL_DATASTORE_KEY]
 end
 
 return PlayerDatastore

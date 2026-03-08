@@ -55,9 +55,10 @@ return {
 		DATASTORE_NAME = "PlayerDatastore", -- // string: Name of the datastore
 		SHARDED_DATASTORE_NAME = "ShardDatastore", -- // string: Name of the sharded datastore
 		GLOBAL_DATASTORE_NAME = "GlobalDatastore", -- // string: Name of the global datastore
-		GLOBAL_HASHMAP_NAME = "GlobalMemoryData", -- // string: MemoryStoreHashMap that will solve conflicts between multiple server .ApplyOperatorGlobal() calls
 		LOCK_DATASTORE_NAME = "SessionLocks", -- // string: Name of the lock datastore
+		PLAYER_METADATA_STORE_NAME = "PlayerMetaDatastore", -- // string: Name of the player metadata datastore (Global data metadata stored in GLOBAL_DATASTORE_NAME)
 
+		GLOBAL_HASHMAP_NAME = "GlobalMemoryData", -- // string: MemoryStoreHashMap that will solve conflicts between multiple server .ApplyOperatorGlobal() calls
 		GLOBAL_DATASTORE_KEY = "GlobalData", -- // string: Key where all global data is stored
 		MEMORY_STORE_KEY = "GlobalMemory", -- // string: Key for MemoryStore to solve global data conflicts
 
