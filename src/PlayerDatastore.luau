@@ -44,8 +44,9 @@ PlayerDatastore.PlayerLoadedSignals = {} :: { [number]: Signal.Signal }
 local PlayerDataStore = DataStoreService:GetDataStore(Config.DATASTORE.DATASTORE_NAME)
 local ShardedDataStore = DataStoreService:GetDataStore(Config.DATASTORE.SHARDED_DATASTORE_NAME)
 local GlobalDataStore = DataStoreService:GetDataStore(Config.DATASTORE.GLOBAL_DATASTORE_NAME)
-local GlobalMemoryStore = MemoryStoreService:GetHashMap(Config.DATASTORE.GLOBAL_HASHMAP_NAME)
 local SessionLockStore = DataStoreService:GetDataStore(Config.DATASTORE.LOCK_DATASTORE_NAME)
+
+local GlobalMemoryStore = MemoryStoreService:GetHashMap(Config.DATASTORE.GLOBAL_HASHMAP_NAME)
 
 --=========================
 -- // PRIVATE API
@@ -456,6 +457,7 @@ local function flushDirty(max_keys: number?): number
 
 			local ShardKeys = collectExistingShards(Key :: number, shardedFields, globalFields)
 			saveShards(ShardKeys)
+
 			saveData(Player)
 		end,
 
@@ -465,10 +467,7 @@ local function flushDirty(max_keys: number?): number
 	}
 
 	for _, Key in ToProcess do
-		local Handler = SaveHandlers[type(Key)]
-		if not Handler then continue end
-
-		Handler(Key)
+		SaveHandlers[type(Key)](Key)
 		PlayerDatastore.DirtyData[Key] = nil
 	end
 
@@ -481,6 +480,7 @@ local function startAutosave(): ()
 		while true do
 			task.wait(Config.DATASTORE.AUTOSAVE_INTERVAL)
 			local flushed = flushDirty(Config.DATASTORE.MAX_KEYS_PER_AUTOSAVE)
+
 			print(`startAutosave(): Flushed {flushed} keys`)
 		end
 	end)
