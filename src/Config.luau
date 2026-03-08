@@ -60,7 +60,9 @@ return {
 		SHARD_BYTE_LIMIT = 1000000, -- // number: Amount of bytes to intake before starting a new key; (JSON Encoded, Per Char)
 
 		AUTOSAVE_INTERVAL = 60, -- // number: Time in seconds between each autosave
-		MAX_KEYS_PER_AUTOSAVE = 50 -- // number: Max amount of keys to save per autosave
+		MAX_KEYS_PER_AUTOSAVE = 50, -- // number: Max amount of keys to save per autosave
+
+		SIGNAL_YIELD_TIME = 1, -- // number: Time in seconds to wait for signal to be created
 	},
 
 	OPERATION_CASES = OPERATION_CASES,

@@ -15,7 +15,6 @@ PlayerDatastore.GlobalLocks = {} :: { [string]: boolean }
 --=========================
 
 local Players = game:GetService("Players")
-local RunService = game:GetService("RunService")
 local DataStoreService = game:GetService("DataStoreService")
 local HttpService = game:GetService("HttpService")
 
@@ -446,6 +445,92 @@ local function startAutosave(): ()
 end
 
 --=========================
+-- // PRIVATE SIGNAL API
+--=========================
+
+-- waitForSignal(): Rare case when signal isn't set up yet
+-- @param user_id: number
+-- @param yield_time: Max time to yield for the signal to be set up
+-- @return: Signal.Signal?
+local function waitForSignal(user_id: number, yield_time: number): Signal.Signal?
+	local deadline = os.clock() + yield_time
+
+	while not PlayerDatastore.PlayerLoadedSignals[user_id] do
+		if os.clock() >= deadline then return nil end
+		if not PlayerDatastore.PlayerData[user_id] then return nil end
+
+		task.wait()
+	end
+
+	return PlayerDatastore.PlayerLoadedSignals[user_id]
+end
+
+--=========================
+-- // PRIVATE INIT API
+--=========================
+
+-- onPlayerAdded(): Handles PlayerAdded, loading data and setting up sharding
+-- @param player: Player
+-- @param data_table: { [any]: any }: The template data table for the player
+-- @param globalFields: { string }: List of global fields to check for sharding
+-- @param shardedFields: { string }: List of sharded fields to set up sharding for
+local function onPlayerAdded(player: Player, data_table: { [any]: any }, globalFields: { string }, shardedFields: { string }): ()
+	PlayerDatastore.PlayerLoadedSignals[player.UserId] = Signal.new()
+
+	local data = loadData(player)
+	local playerTemplate = stripGlobalFields(data_table, globalFields)
+
+	local reconciled: { [any]: any }
+
+	if data then
+		reconciled = reconcileData(data, playerTemplate)
+	else
+		reconciled = playerTemplate
+	end
+
+	PlayerDatastore.PlayerData[player.UserId] = reconciled
+
+	for _, table_path in shardedFields do
+		if table.find(globalFields, table_path) then
+			continue
+		end
+
+		local tbl = resolvePath(PlayerDatastore.PlayerData[player.UserId], table_path)
+
+		if tbl == nil then
+			warn("Init(): Sharded field not found in data template:", table_path)
+			continue
+		end
+
+		if type(tbl) ~= "table" then
+			warn("Init(): Sharded field is not a table:", table_path)
+			continue
+		end
+
+		if not tbl.__sharded then
+			setPath(PlayerDatastore.PlayerData[player.UserId], table_path, {
+				__sharded = true,
+				count = 0
+			})
+			continue
+		end
+
+		for i = 1, tbl.count do
+			local shardKey = getShardKey(player.UserId, table_path, i)
+
+			pcall(function()
+				local shardData = ShardedDataStore:GetAsync(shardKey)
+				if shardData then
+					PlayerDatastore.ShardData[shardKey] = HttpService:JSONDecode(shardData)
+				end
+			end)
+		end
+	end
+
+	PlayerDatastore.PlayerLoadedSignals[player.UserId]:FireDeferred()
+end
+
+--=========================
 -- // PUBLIC API
 --=========================
 
@@ -459,55 +544,12 @@ function PlayerDatastore.Init(data_table: { [any]: any }, presets: Types.PresetO
 	local globalFields: { string } = presets and presets.GlobalFields or {}
 
 	Players.PlayerAdded:Connect(function(player)
-		PlayerDatastore.PlayerLoadedSignals[player.UserId] = Signal.new()
-
-		local data = loadData(player)
-		local playerTemplate = stripGlobalFields(data_table, globalFields)
-
-		local reconciled: { [any]: any }
-
-		if data then
-			reconciled = reconcileData(data, playerTemplate)
-		else
-			reconciled = playerTemplate
-		end
-
-		PlayerDatastore.PlayerData[player.UserId] = reconciled
-
-		for _, table_path in shardedFields do
-			if table.find(globalFields, table_path) then
-				continue
-			end
-
-			local tbl = resolvePath(PlayerDatastore.PlayerData[player.UserId], table_path)
-
-			if type(tbl) ~= "table" then
-				warn("Init(): Sharded field is not a table:", table_path)
-				continue
-			end
-
-			if not tbl.__sharded then
-				setPath(PlayerDatastore.PlayerData[player.UserId], table_path, {
-					__sharded = true,
-					count = 0
-				})
-				continue
-			end
-
-			for i = 1, tbl.count do
-				local shardKey = getShardKey(player.UserId, table_path, i)
-
-				pcall(function()
-					local shardData = ShardedDataStore:GetAsync(shardKey)
-					if shardData then
-						PlayerDatastore.ShardData[shardKey] = HttpService:JSONDecode(shardData)
-					end
-				end)
-			end
-		end
-
-		PlayerDatastore.PlayerLoadedSignals[player.UserId]:FireDeferred()
+		onPlayerAdded(player, data_table, globalFields, shardedFields)
 	end)
+
+	for _, player in Players:GetPlayers() do
+		task.spawn(onPlayerAdded, player, data_table, globalFields, shardedFields)
+	end
 
 	local globalData = loadGlobalData()
 
@@ -515,13 +557,33 @@ function PlayerDatastore.Init(data_table: { [any]: any }, presets: Types.PresetO
 		local loadedValue = globalData[table_path]
 		local defaultValue = resolvePath(data_table, table_path)
 
-		PlayerDatastore.GlobalData[table_path] = reconcileData(loadedValue, defaultValue)
-
-		if not isSharded(PlayerDatastore.GlobalData[table_path]) then
+		if defaultValue == nil then
+			warn("Init(): Global field not found in data template:", table_path)
 			continue
 		end
 
-		for i = 1, PlayerDatastore.GlobalData[table_path].count do
+		if type(loadedValue) == "table" and loadedValue.__sharded then
+			PlayerDatastore.GlobalData[table_path] = {
+				__sharded = true,
+				count = loadedValue.count or 0
+			}
+		else
+			PlayerDatastore.GlobalData[table_path] = reconcileData(loadedValue, defaultValue)
+		end
+
+		local tbl = PlayerDatastore.GlobalData[table_path]
+
+		if not table.find(shardedFields, table_path) then continue end
+
+		if not isSharded(tbl) then
+			PlayerDatastore.GlobalData[table_path] = {
+				__sharded = true,
+				count = 0
+			}
+			continue
+		end
+
+		for i = 1, tbl.count do
 			local shardKey = getShardGlobalKey(table_path, i)
 
 			pcall(function()
@@ -594,8 +656,6 @@ function PlayerDatastore.Init(data_table: { [any]: any }, presets: Types.PresetO
 	end)
 
 	startAutosave()
-
-	RunService.Heartbeat:Wait()
 end
 
 -- Read(): Reads the player's data, unshards if sharded
@@ -603,14 +663,14 @@ end
 -- @param table_path: The path to the table to read
 -- @return: { [any]: any }
 function PlayerDatastore.Read(player: Player, table_path: string): { [any]: any }?
-	local playerSig = PlayerDatastore.PlayerLoadedSignals[player.UserId]
+	local playerSig = waitForSignal(player.UserId, Config.DATASTORE.SIGNAL_YIELD_TIME)
 
-	if playerSig then
-		playerSig:DeferredWait()
-	else
-		warn("Read(): No load signal for player", player.Name)
+	if not playerSig then
+		warn("Read(): Timed out waiting for load signal:", player.Name)
 		return nil
 	end
+
+	playerSig:DeferredWait()
 
 	local data = PlayerDatastore.PlayerData[player.UserId]
 
@@ -654,14 +714,14 @@ end
 -- @param player: The player who is doing the operation
 -- @param operation: Types.OperationType (value_name, operator, value)
 function PlayerDatastore.ApplyOperator(player: Player, operation: Types.OperationType): ()
-	local playerSig = PlayerDatastore.PlayerLoadedSignals[player.UserId]
+	local playerSig = waitForSignal(player.UserId, Config.DATASTORE.SIGNAL_YIELD_TIME)
 
-	if playerSig then
-		playerSig:DeferredWait()
-	else
-		warn("ApplyOperator(): No load signal for player", player.Name)
+	if not playerSig then
+		warn("ApplyOperator(): Timed out waiting for load signal:", player.Name)
 		return
 	end
+
+	playerSig:DeferredWait()
 
 	local data = PlayerDatastore.PlayerData[player.UserId]
 
@@ -718,14 +778,14 @@ end
 -- DeletePlayerData(): Deletes a player's data
 -- @param player: The player to delete data for
 function PlayerDatastore.DeletePlayerData(player: Player): ()
-	local playerSig = PlayerDatastore.PlayerLoadedSignals[player.UserId]
+	local playerSig = waitForSignal(player.UserId, Config.DATASTORE.SIGNAL_YIELD_TIME)
 
-	if playerSig then
-		playerSig:DeferredWait()
-	else
-		warn("DeletePlayerData(): No load signal for player", player.Name)
+	if not playerSig then
+		warn("DeletePlayerData(): Timed out waiting for load signal:", player.Name)
 		return
 	end
+
+	playerSig:DeferredWait()
 
 	local userId = player.UserId
 
@@ -745,6 +805,8 @@ function PlayerDatastore.DeletePlayerData(player: Player): ()
 
 			for i = 1, tbl.count do
 				local shardKey = getShardKey(userId, table_path, i)
+
+				PlayerDatastore.ShardData[shardKey] = nil
 
 				pcall(function()
 					ShardedDataStore:RemoveAsync(shardKey)
@@ -779,17 +841,22 @@ function PlayerDatastore.DeleteGlobalData(path: string): ()
 		for i = 1, tbl.count do
 			local shardKey = getShardGlobalKey(path, i)
 
+			PlayerDatastore.ShardData[shardKey] = nil
+
 			pcall(function()
 				ShardedDataStore:RemoveAsync(shardKey)
 			end)
 		end
 	end
 
-	pcall(function()
-		GlobalDataStore:RemoveAsync(path)
-	end)
-
 	PlayerDatastore.GlobalData[path] = nil
+
+	pcall(function()
+		GlobalDataStore:SetAsync(
+			Config.DATASTORE.GLOBAL_DATASTORE_KEY,
+			HttpService:JSONEncode(PlayerDatastore.GlobalData)
+		)
+	end)
 end
 
 --=========================
@@ -1099,14 +1166,14 @@ end
 -- @param player: The player to get data for
 -- @return: { [any]: any }?
 function PlayerDatastore.GetPlayerData(player: Player): { [any]: any }?
-	local playerSig = PlayerDatastore.PlayerLoadedSignals[player.UserId]
+	local playerSig = waitForSignal(player.UserId, Config.DATASTORE.SIGNAL_YIELD_TIME)
 
-	if playerSig then
-		playerSig:DeferredWait()
-	else
-		warn("GetPlayerData(): No load signal for player", player.Name)
+	if not playerSig then
+		warn("GetPlayerData(): Timed out waiting for load signal:", player.Name)
 		return nil
 	end
+
+	playerSig:DeferredWait()
 
 	return PlayerDatastore.PlayerData[player.UserId]
 end
@@ -1116,14 +1183,14 @@ end
 -- @param key?: Optional Key to get shard data for; else returns the entire table
 -- @return: { [string]: any } | any
 function PlayerDatastore.GetShardData(player: Player, key: string?): { [string]: any } | any
-	local playerSig = PlayerDatastore.PlayerLoadedSignals[player.UserId]
+	local playerSig = waitForSignal(player.UserId, Config.DATASTORE.SIGNAL_YIELD_TIME)
 
-	if playerSig then
-		playerSig:DeferredWait()
-	else
-		warn("GetShardData(): No load signal for player", player.Name)
+	if not playerSig then
+		warn("GetShardData(): Timed out waiting for load signal:", player.Name)
 		return {}
 	end
+
+	playerSig:DeferredWait()
 
 	Config.FLAGS.GlobalDataLoaded:DeferredWait()
 
