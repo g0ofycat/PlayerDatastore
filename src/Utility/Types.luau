@@ -30,6 +30,8 @@ export type SnapshotEntry = {
 	Version: string
 }
 
+export type MetadataSnapshotEntry = { Key: string, Timestamp: number }
+
 export type SessionEntry = { JobID: string, Timestamp: number }
 
 export type MigrationFunction = (Data: { [any]: any }) -> { [any]: any }

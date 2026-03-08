@@ -232,6 +232,7 @@ function PlayerDatastore.GetMetadata(player: Player?): Types.MetaData?
 -- @param to_version: string
 -- @param migration: Types.MigrationFunction
 -- @note: Only linear chains are supported, one outgoing migration per source version
+-- @note: If ShardedFields changed between versions, manually unshard affected fields inside the migration function before transforming them, as only current ShardedFields are automatically unsharded before migration runs
 function PlayerDatastore.RegisterMigration(from_version: string, to_version: string, migration: Types.MigrationFunction): ()
 ```
 
