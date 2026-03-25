@@ -96,7 +96,7 @@ local function reconcileData(loaded: { [any]: any }, schema: { [any]: any }): { 
 			return schema
 		end
 
-		return loaded
+		return if loaded ~= nil then loaded else schema
 	end
 
 	if typeof(loaded) ~= "table" then
