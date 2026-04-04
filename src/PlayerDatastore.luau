@@ -186,6 +186,12 @@ local function setPath(tbl: any, path: string, value: any): ()
 	end
 end
 
+-- getPresetFields(): Gets sharded and global fields from PlayerDatastore.Presets
+-- @return: ({ string }, { string }): ShardedFields, GlobalFields
+local function getPresetFields(): ({ string }, { string })
+	return PlayerDatastore.Presets and PlayerDatastore.Presets.ShardedFields or {}, PlayerDatastore.Presets and PlayerDatastore.Presets.GlobalFields or {}
+end
+
 -- findShardedPath(): Finds the sharded path for a value
 -- @param data: { [any]: any }
 -- @param valueName: string
@@ -580,7 +586,7 @@ local function saveData(player: Player): ()
 	local data = PlayerDatastore.PlayerData[player.UserId]
 	if not data then return end
 
-	local shardedFields: { string } = PlayerDatastore.Presets and PlayerDatastore.Presets.ShardedFields or {}
+	local shardedFields, _ = getPresetFields()
 
 	for _, table_path in shardedFields do
 		local tbl = resolvePath(data, table_path)
@@ -619,8 +625,7 @@ end
 -- saveGlobalData(): Saves global data to the GlobalDataStore
 -- @note: Automatically JSON encodes the value; reshards if needed
 local function saveGlobalData(): ()
-	local globalFields: { string } = PlayerDatastore.Presets and PlayerDatastore.Presets.GlobalFields or {}
-    local shardedFields: { string } = PlayerDatastore.Presets and PlayerDatastore.Presets.ShardedFields or {}
+	local shardedFields, globalFields = getPresetFields()
 
     local liveData = if not PlayerDatastore._localAheadOfMemory then readMemoryGlobal() else nil
     local dataToSave = {}
@@ -891,8 +896,7 @@ end
 -- @param max_keys: Optional capacity on how many keys to save this cycle (default: all)
 -- @return: number: Amount of keys flushed
 local function flushDirty(max_keys: number?): number
-	local shardedFields: { string } = PlayerDatastore.Presets and PlayerDatastore.Presets.ShardedFields or {}
-	local globalFields: { string } = PlayerDatastore.Presets and PlayerDatastore.Presets.GlobalFields or {}
+	local shardedFields, globalFields = getPresetFields()
 	local Limit = max_keys or math.huge
 	local ToProcess: { number | string } = {}
 
@@ -1540,8 +1544,7 @@ function PlayerDatastore.DeletePlayerData(player: Player): ()
 
 	cleanupOperationQueues(player.UserId)
 
-	local shardedFields: { string } = PlayerDatastore.Presets and PlayerDatastore.Presets.ShardedFields or {}
-	local globalFields: { string } = PlayerDatastore.Presets and PlayerDatastore.Presets.GlobalFields or {}
+	local shardedFields, globalFields = getPresetFields()
 
 	for _, table_path in shardedFields do
 		if table.find(globalFields, table_path) then continue end
@@ -1584,7 +1587,7 @@ end
 function PlayerDatastore.DeleteGlobalData(path: string): ()
 	yieldGlobalData()
 
-	local globalFields: { string } = PlayerDatastore.Presets and PlayerDatastore.Presets.GlobalFields or {}
+	local _, globalFields = getPresetFields()
 
 	if not table.find(globalFields, path) then
 		warn("DeleteGlobalData(): Path is not a valid global field:", path)
@@ -1692,8 +1695,7 @@ end
 function PlayerDatastore.ApplyOperatorGlobal(operation: Types.OperationType): ()
 	yieldGlobalData()
 
-	local globalFields: { string } = PlayerDatastore.Presets and PlayerDatastore.Presets.GlobalFields or {}
-	local shardedFields: { string } = PlayerDatastore.Presets and PlayerDatastore.Presets.ShardedFields or {}
+	local shardedFields, globalFields = getPresetFields()
 	local pathParts = string.split(operation.value_name, ".")
 
 	if not table.find(globalFields, pathParts[1]) then
@@ -1911,8 +1913,7 @@ function PlayerDatastore.RestoreSnapshot(name: string, player: Player?): ()
 			setPath(data, snapshot.Path, deepClone(snapshot.Data))
 		end
 
-		local shardedFields: { string } = PlayerDatastore.Presets and PlayerDatastore.Presets.ShardedFields or {}
-		local globalFields: { string }  = PlayerDatastore.Presets and PlayerDatastore.Presets.GlobalFields or {}
+		local shardedFields, globalFields = getPresetFields()
 
 		if snapshot.Path ~= "" and table.find(shardedFields, snapshot.Path) and not table.find(globalFields, snapshot.Path) then
 			PlayerDatastore.Shard(player, snapshot.Path, true)
@@ -1944,8 +1945,7 @@ function PlayerDatastore.RestoreSnapshot(name: string, player: Player?): ()
 
 		local liveData, _ = readMemoryGlobal()
 		if liveData then
-			local globalFields: { string } = PlayerDatastore.Presets and PlayerDatastore.Presets.GlobalFields or {}
-			local shardedFields: { string } = PlayerDatastore.Presets and PlayerDatastore.Presets.ShardedFields or {}
+			local shardedFields, globalFields = getPresetFields()
 			syncGlobalFromMemory(liveData, globalFields, shardedFields)
 		end
 
