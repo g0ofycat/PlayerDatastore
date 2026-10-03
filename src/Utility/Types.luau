@@ -1,8 +1,8 @@
 --!strict
 
-export type OperationType = {
-	value_name: string,
-	value: (currentValue: any) -> any
+export type WriteType = {
+	path: string,
+	transform: (currentValue: any) -> any
 }
 
 export type PresetOptions = {

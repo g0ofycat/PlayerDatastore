@@ -10,7 +10,7 @@ PlayerDatastore.SessionLockHeartbeats = {} :: { [number]: boolean }
 PlayerDatastore.SessionLockLost = {} :: { [number]: boolean }
 PlayerDatastore.PendingShardRemovals = {} :: { [number | string]: { [string]: boolean? } }
 
-PlayerDatastore.OperationQueues = {} :: { [number]: { thread } }
+PlayerDatastore.WriteQueues = {} :: { [number]: { thread } }
 PlayerDatastore.LoadingQueues = {} :: { [number]: { thread } }
 
 PlayerDatastore.LoadingPlayers = {} :: { [number]: boolean }
@@ -316,31 +316,31 @@ local function writeMemoryGlobal(callback: (current: { [string]: any }) -> { [st
 end
 
 --=========================
--- // PRIVATE OPERATION LOCK API
+-- // PRIVATE WRITE LOCK API
 --=========================
 
--- acquireOperationLock(): Acquires an operation lock for a user, yielding if necessary until the lock is acquired
+-- acquireWriteLock(): Acquires a write lock for a user, yielding if necessary until the lock is acquired
 -- @param user_id: number
 -- @return: boolean: Whether the lock was acquired
-local function acquireOperationLock(user_id: number): boolean
-	if not PlayerDatastore.OperationQueues[user_id] then
-		PlayerDatastore.OperationQueues[user_id] = {}
+local function acquireWriteLock(user_id: number): boolean
+	if not PlayerDatastore.WriteQueues[user_id] then
+		PlayerDatastore.WriteQueues[user_id] = {}
 		return true
 	end
 
-	local queue = PlayerDatastore.OperationQueues[user_id]
+	local queue = PlayerDatastore.WriteQueues[user_id]
 	table.insert(queue, coroutine.running())
 	coroutine.yield()
 
 	return PlayerDatastore.PlayerData[user_id] ~= nil
 end
 
--- releaseOperationLock(): Releases an operation lock for a user, resuming the next thread in the queue if there is one
+-- releaseWriteLock(): Releases a write lock for a user, resuming the next thread in the queue if there is one
 -- @param user_id: number
-local function releaseOperationLock(user_id: number): ()
-	local queue = PlayerDatastore.OperationQueues[user_id]
+local function releaseWriteLock(user_id: number): ()
+	local queue = PlayerDatastore.WriteQueues[user_id]
 	if not queue or #queue == 0 then
-		PlayerDatastore.OperationQueues[user_id] = nil
+		PlayerDatastore.WriteQueues[user_id] = nil
 		return
 	end
 
@@ -700,7 +700,7 @@ end
 
 -- saveData(): Saves the players data
 -- @param player: The player to save the data for
--- @note: Shards unsharded data marked as __sharded; ApplyOperator unshards to apply operations. While doing this, the player could leave, having corrupted sharded data that may exceed the 4MB Key Limit. This fixes it
+-- @note: Shards unsharded data marked as __sharded; Write unshards to apply changes. While doing this, the player could leave, having corrupted sharded data that may exceed the 4MB Key Limit. This fixes it
 local function saveData(player: Player?, user_id: number?): boolean
 	local userId = if player then player.UserId else user_id
 	if not userId then return false end
@@ -1199,17 +1199,17 @@ local function cleanupLoadingState(user_id: number): ()
     end
 end
 
--- cleanupOperationQueues(): Resumes any threads waiting on operation locks and clears user_id in OperationQueues
+-- cleanupWriteQueues(): Resumes any threads waiting on write locks and clears user_id in WriteQueues
 -- @param user_id: number
-local function cleanupOperationQueues(user_id: number): ()
-	local queue = PlayerDatastore.OperationQueues[user_id]
+local function cleanupWriteQueues(user_id: number): ()
+	local queue = PlayerDatastore.WriteQueues[user_id]
 	if not queue then return end
 
 	for _, thread in queue do
 		task.spawn(thread)
 	end
 
-	PlayerDatastore.OperationQueues[user_id] = nil
+	PlayerDatastore.WriteQueues[user_id] = nil
 end
 
 -- cleanupGlobalDataWaiters(): Resumes any threads waiting on global data load and clears the waiters list
@@ -1594,7 +1594,7 @@ function PlayerDatastore.Init(data_table: { [any]: any }, presets: Types.PresetO
 		end
 
 		cleanupLoadingState(player.UserId)
-		cleanupOperationQueues(player.UserId)
+		cleanupWriteQueues(player.UserId)
 	end)
 
 	game:BindToClose(function()
@@ -1619,7 +1619,7 @@ function PlayerDatastore.Init(data_table: { [any]: any }, presets: Types.PresetO
 				warn("BindToClose: Could not fully save data for", player.Name)
 			end
 
-			cleanupOperationQueues(player.UserId)
+			cleanupWriteQueues(player.UserId)
 		end
 
 		for attempt = 1, Config.DATASTORE.LOCK_MAX_RETRIES do
@@ -1692,27 +1692,27 @@ function PlayerDatastore.Read(player: Player, table_path: string): { [any]: any 
 	return resolvePath(data, table_path)
 end
 
--- ApplyOperator(): Applies an operation to a players data
--- @param player: The player who is doing the operation
--- @param operation: Types.OperationType (value_name, value = transform)
-function PlayerDatastore.ApplyOperator(player: Player, operation: Types.OperationType): ()
+-- Write(): Applies a transform to a player's data at a path
+-- @param player: The player whose data is being updated
+-- @param write: Types.WriteType (path, transform)
+function PlayerDatastore.Write(player: Player, write: Types.WriteType): ()
 	yieldPlayerData(player.UserId)
 	if PlayerDatastore.SessionLockLost[player.UserId] then
-		warn("ApplyOperator(): Refusing operation after session-lock ownership was lost for", player.Name)
+		warn("Write(): Refusing write after session-lock ownership was lost for", player.Name)
 		return
 	end
 
-	local ok = acquireOperationLock(player.UserId)
+	local ok = acquireWriteLock(player.UserId)
 	if not ok then return end
 
 	local data = PlayerDatastore.PlayerData[player.UserId]
 	if not data then
-		warn("ApplyOperator(): No data for player:", player.Name, "; Operation dropped")
-		releaseOperationLock(player.UserId)
+		warn("Write(): No data for player:", player.Name, "; write dropped")
+		releaseWriteLock(player.UserId)
 		return
 	end
 
-	local shardedPath = findShardedPath(data, operation.value_name)
+	local shardedPath = findShardedPath(data, write.path)
 	local prevShardCount = 0
 
 	if shardedPath then
@@ -1733,8 +1733,8 @@ function PlayerDatastore.ApplyOperator(player: Player, operation: Types.Operatio
 		end
 
 		if missingShard then
-			warn("ApplyOperator(): Missing shard for", player.Name, "; operation dropped")
-			releaseOperationLock(player.UserId)
+			warn("Write(): Missing shard for", player.Name, "; write dropped")
+			releaseWriteLock(player.UserId)
 			return
 		end
 
@@ -1746,23 +1746,23 @@ function PlayerDatastore.ApplyOperator(player: Player, operation: Types.Operatio
 	end
 
 	local success, failure = pcall(function()
-		local currentValue = resolvePath(data, operation.value_name)
+		local currentValue = resolvePath(data, write.path)
 		if currentValue == nil then
-			error(`ApplyOperator(): Couldn't find value: {operation.value_name}`)
+			error(`Write(): Couldn't find value: {write.path}`)
 		end
 
-		local newValue = operation.value(currentValue)
-		setPath(data, operation.value_name, newValue)
+		local newValue = write.transform(currentValue)
+		setPath(data, write.path, newValue)
 	end)
 
 	if not success then
-		warn("ApplyOperator(): Failed to apply operation for", player.Name, ":", failure)
+		warn("Write(): Failed to apply transform for", player.Name, ":", failure)
 
 		if shardedPath then
 			PlayerDatastore.Shard(player, shardedPath, true)
 		end
 
-		releaseOperationLock(player.UserId)
+		releaseWriteLock(player.UserId)
 		return
 	end
 
@@ -1778,7 +1778,7 @@ function PlayerDatastore.ApplyOperator(player: Player, operation: Types.Operatio
 		end)
 	end
 
-	releaseOperationLock(player.UserId)
+	releaseWriteLock(player.UserId)
 end
 
 -- DeletePlayerData(): Deletes a players data
@@ -1793,7 +1793,7 @@ function PlayerDatastore.DeletePlayerData(player: Player): ()
 
 	local user_id = player.UserId
 
-	cleanupOperationQueues(player.UserId)
+	cleanupWriteQueues(player.UserId)
 
 	local shardedFields, globalFields = getPresetFields()
 
@@ -1875,7 +1875,7 @@ function PlayerDatastore.DeleteGlobalData(path: string): ()
 end
 
 --=========================
--- // COMPLEX OPERATIONS
+-- // COMPLEX WRITE API
 --=========================
 
 -- Shard(): Enables sharding for a table path (Check Config.DATASTORE.SHARD_BYTE_LIMIT)
@@ -1936,7 +1936,7 @@ function PlayerDatastore.ShardGlobal(path: string, enable: boolean): ()
 end
 
 --=========================
--- // GLOBAL OPERATIONS
+-- // GLOBAL WRITE API
 --=========================
 
 -- ReadGlobal(): Reads a global table or value, unshards if needed
@@ -1963,23 +1963,23 @@ function PlayerDatastore.ReadGlobal(path: string): any
 	return readGlobalField(liveData, path)
 end
 
--- ApplyOperatorGlobal(): Applies an operation to a global table
--- @param operation: Types.OperationType (value_name, value = transform)
-function PlayerDatastore.ApplyOperatorGlobal(operation: Types.OperationType): ()
+-- WriteGlobal(): Applies a transform to a global value at a path
+-- @param write: Types.WriteType (path, transform)
+function PlayerDatastore.WriteGlobal(write: Types.WriteType): ()
 	yieldGlobalData()
 
 	local shardedFields, globalFields = getPresetFields()
 	local validGlobalPath = false
 	for _, globalPath in globalFields do
-		local suffix = operation.value_name:sub(#globalPath + 1)
-		if operation.value_name == globalPath or suffix:sub(1, 1) == "." or suffix:sub(1, 1) == "[" then
+		local suffix = write.path:sub(#globalPath + 1)
+		if write.path == globalPath or suffix:sub(1, 1) == "." or suffix:sub(1, 1) == "[" then
 			validGlobalPath = true
 			break
 		end
 	end
 
 	if not validGlobalPath then
-		warn("ApplyOperatorGlobal(): Path doesn't start with a valid global field:", operation.value_name)
+		warn("WriteGlobal(): Path doesn't start with a valid global field:", write.path)
 		return
 	end
 
@@ -1996,13 +1996,13 @@ function PlayerDatastore.ApplyOperatorGlobal(operation: Types.OperationType): ()
 			end
 		end
 
-		local currentValue = resolvePath(base, operation.value_name)
+		local currentValue = resolvePath(base, write.path)
 		if currentValue == nil then
-			warn("ApplyOperatorGlobal(): Couldn't find value:", operation.value_name)
+			warn("WriteGlobal(): Couldn't find value:", write.path)
 			return nil
 		end
 
-		setPath(base, operation.value_name, operation.value(currentValue))
+		setPath(base, write.path, write.transform(currentValue))
 		liveData = base
 		return base
 	end)
@@ -2010,25 +2010,25 @@ function PlayerDatastore.ApplyOperatorGlobal(operation: Types.OperationType): ()
 	if not success then
 		PlayerDatastore._localAheadOfMemory = true
 
-		warn("ApplyOperatorGlobal(): MemoryStore unavailable, applying to local cache only. State may differ across servers until MemoryStore recovers")
+		warn("WriteGlobal(): MemoryStore unavailable, applying to local cache only. State may differ across servers until MemoryStore recovers")
 
-		local shardedPath = findShardedPath(PlayerDatastore.GlobalData, operation.value_name)
+		local shardedPath = findShardedPath(PlayerDatastore.GlobalData, write.path)
 		if shardedPath then
 			PlayerDatastore.ShardGlobal(shardedPath, false)
 			if isSharded(resolvePath(PlayerDatastore.GlobalData, shardedPath)) then
-				warn("ApplyOperatorGlobal(): Missing shard for", shardedPath, "; operation dropped")
+				warn("WriteGlobal(): Missing shard for", shardedPath, "; write dropped")
 				return
 			end
 		end
 
-		local currentValue = resolvePath(PlayerDatastore.GlobalData, operation.value_name)
+		local currentValue = resolvePath(PlayerDatastore.GlobalData, write.path)
 		if currentValue == nil then
-			warn("ApplyOperatorGlobal(): Couldn't find value in local cache:", operation.value_name)
+			warn("WriteGlobal(): Couldn't find value in local cache:", write.path)
 			if shardedPath then PlayerDatastore.ShardGlobal(shardedPath, true) end
 			return
 		end
 
-		setPath(PlayerDatastore.GlobalData, operation.value_name, operation.value(currentValue))
+		setPath(PlayerDatastore.GlobalData, write.path, write.transform(currentValue))
 		if shardedPath then PlayerDatastore.ShardGlobal(shardedPath, true) end
 
 		markDirty(Config.DATASTORE.GLOBAL_DATASTORE_KEY)
@@ -2036,7 +2036,7 @@ function PlayerDatastore.ApplyOperatorGlobal(operation: Types.OperationType): ()
 	end
 
 	if not committed then
-		warn("ApplyOperatorGlobal(): Operation failed to commit, operation not applied")
+		warn("WriteGlobal(): Write failed to commit; write not applied")
 		return
 	end
 
@@ -2220,7 +2220,7 @@ function PlayerDatastore.RestoreSnapshot(name: string, player: Player?): ()
 		end
 
 		if not committed then
-			warn("RestoreSnapshot(): Operation failed to commit, operation not applied")
+			warn("RestoreSnapshot(): Global write failed to commit; restore not applied")
 			return
 		end
 

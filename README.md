@@ -1,6 +1,6 @@
 # PlayerDatastore (Roblox)
 
-A high level datastore abstraction for Roblox that handles automatic **yielding**, **sharding**, and **global data**. Allows instant datastore operations **without manual yield handling**. This datastore also includes **Session Locking**, **Metadata**, and **Snapshots**
+A high level datastore abstraction for Roblox that handles automatic **yielding**, **sharding**, and **global data**. Allows instant datastore reads and writes **without manual yield handling**. This datastore also includes **Session Locking**, **Metadata**, and **Snapshots**
 
 ## Core Features
 
@@ -8,7 +8,7 @@ A high level datastore abstraction for Roblox that handles automatic **yielding*
 - Field sharding
 - Global fields
 - Path-based table access
-- Atomic operators
+- Atomic writes
 - Basic Session Locking
 - Player and Global Metadata
 - Snapshots (Versioning to create "Snapshots" of data in which you can migrate data to the main datastores)
@@ -45,18 +45,18 @@ export type PresetOptions = {
 }
 ```
 
-### Applying Operators:
+### Writing Data:
 
-To apply changes to data in the database, you use **operators**
+Use a transform to update a value at a path.
 
-#### PlayerDatastore.ApplyOperator(player: Player, operation: Types.OperationType): ()
+#### PlayerDatastore.Write(player: Player, write: Types.WriteType): ()
 
-This is for non-global fields. **When a table is sharded, it: Unshards, applies changes, then reshards. If a players leaves mid-operation, then all tables marked as sharded yet not sharded get resharded. This applies to ApplyOperatorGlobal too**
+This is for non-global fields. **When a table is sharded, it: Unshards, applies the transform, then reshards. If a player leaves mid-write, all tables marked as sharded yet not sharded get resharded. This also applies to WriteGlobal.**
 
 ```lua
-PlayerDatastore.ApplyOperator(player, {
-	value_name = "player_data.progression",
-	value = function(currentValue)
+PlayerDatastore.Write(player, {
+	path = "player_data.progression",
+	transform = function(currentValue)
 		local updatedValue = table.clone(currentValue)
 		updatedValue.Coins = 500
 		return updatedValue
@@ -72,14 +72,14 @@ Read function for player-bound data.
 PlayerDatastore.Read(player, "player_data.progression") -- // { ["Coins"] = 500 }
 ```
 
-#### PlayerDatastore.ApplyOperatorGlobal(operation: Types.OperationType): ()
+#### PlayerDatastore.WriteGlobal(write: Types.WriteType): ()
 
-Exactly the same as **ApplyOperator** except it's not player-bound, meaning it doesn't have a player param
+Exactly the same as **Write** except it is not player-bound, so it does not take a player parameter.
 
 ```lua
-PlayerDatastore.ApplyOperatorGlobal({
-	value_name = "unordered_map",
-	value = function(currentValue)
+PlayerDatastore.WriteGlobal({
+	path = "unordered_map",
+	transform = function(currentValue)
 		local updatedValue = table.clone(currentValue)
 		updatedValue.K = "V"
 		return updatedValue
@@ -95,14 +95,14 @@ Read function for non player-bound data.
 PlayerDatastore.ReadGlobal("unordered_map") -- // { ["K"] = "V" }
 ```
 
-### Custom Operations:
+### Write Transform Type:
 
-The custom transform receives the current value at `value_name` and must return the replacement value:
+The transform receives the current value at `path` and must return its replacement:
 
 ```lua
-export type OperationType = {
-	value_name: string,
-	value: (currentValue: any) -> any
+export type WriteType = {
+	path: string,
+	transform: (currentValue: any) -> any
 }
 ```
 
@@ -159,7 +159,7 @@ Players on `v.1.0.0` will run both steps in order on their next load.
 
 The rest of the API is self-explanatory:
 
-### Sharding (Automatically handled every operation):
+### Sharding (Automatically handled for reads and writes):
 
 ```lua
 -- Shard(): Enables sharding for a table path (Check Config.DATASTORE.SHARD_BYTE_LIMIT)
