@@ -113,6 +113,10 @@ local function reconcileData(loaded: { [any]: any }, schema: { [any]: any }): { 
 		return deepClone(loaded)
 	end
 
+	if next(schema) == nil then
+		return deepClone(loaded)
+	end
+
 	local result = {}
 	for key, schemaValue in schema do
 		result[key] = reconcileData(loaded[key], schemaValue)
