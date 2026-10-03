@@ -2,11 +2,8 @@
 
 export type OperationType = {
 	value_name: string,
-	operator: ValueOperators,
-	value: any
+	value: (currentValue: any) -> any
 }
-
-export type ValueOperators = "+" | "-" | "*" | "/" | "SET" | "INSERT" | "PUSH" | "DELETE"
 
 export type PresetOptions = {
 	ShardedFields: { string }?, -- // { string }: Table Paths to be sharded

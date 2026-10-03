@@ -1690,7 +1690,7 @@ end
 
 -- ApplyOperator(): Applies an operation to a players data
 -- @param player: The player who is doing the operation
--- @param operation: Types.OperationType (value_name, operator, value)
+-- @param operation: Types.OperationType (value_name, value = transform)
 function PlayerDatastore.ApplyOperator(player: Player, operation: Types.OperationType): ()
 	yieldPlayerData(player.UserId)
 	if PlayerDatastore.SessionLockLost[player.UserId] then
@@ -1747,7 +1747,7 @@ function PlayerDatastore.ApplyOperator(player: Player, operation: Types.Operatio
 			error(`ApplyOperator(): Couldn't find value: {operation.value_name}`)
 		end
 
-		local newValue = Config.OPERATION_CASES[operation.operator](currentValue, operation.value)
+		local newValue = operation.value(currentValue)
 		setPath(data, operation.value_name, newValue)
 	end)
 
@@ -1960,7 +1960,7 @@ function PlayerDatastore.ReadGlobal(path: string): any
 end
 
 -- ApplyOperatorGlobal(): Applies an operation to a global table
--- @param operation: Types.OperationType (value_name, operator, value)
+-- @param operation: Types.OperationType (value_name, value = transform)
 function PlayerDatastore.ApplyOperatorGlobal(operation: Types.OperationType): ()
 	yieldGlobalData()
 
@@ -1998,7 +1998,7 @@ function PlayerDatastore.ApplyOperatorGlobal(operation: Types.OperationType): ()
 			return nil
 		end
 
-		setPath(base, operation.value_name, Config.OPERATION_CASES[operation.operator](currentValue, operation.value))
+		setPath(base, operation.value_name, operation.value(currentValue))
 		liveData = base
 		return base
 	end)
@@ -2024,7 +2024,7 @@ function PlayerDatastore.ApplyOperatorGlobal(operation: Types.OperationType): ()
 			return
 		end
 
-		setPath(PlayerDatastore.GlobalData, operation.value_name, Config.OPERATION_CASES[operation.operator](currentValue, operation.value))
+		setPath(PlayerDatastore.GlobalData, operation.value_name, operation.value(currentValue))
 		if shardedPath then PlayerDatastore.ShardGlobal(shardedPath, true) end
 
 		markDirty(Config.DATASTORE.GLOBAL_DATASTORE_KEY)

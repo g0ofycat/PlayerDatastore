@@ -54,7 +54,14 @@ To apply changes to data in the database, you use **operators**
 This is for non-global fields. **When a table is sharded, it: Unshards, applies changes, then reshards. If a players leaves mid-operation, then all tables marked as sharded yet not sharded get resharded. This applies to ApplyOperatorGlobal too**
 
 ```lua
-PlayerDatastore.ApplyOperator(player, { value_name = "player_data.progression", operator = "INSERT", value = { ["Coins"] = 500 } }) -- // "player_data.progression" can also be ("player_data['progression']" OR 'player_data["progression"]')
+PlayerDatastore.ApplyOperator(player, {
+	value_name = "player_data.progression",
+	value = function(currentValue)
+		local updatedValue = table.clone(currentValue)
+		updatedValue.Coins = 500
+		return updatedValue
+	end
+}) -- // "player_data.progression" can also be ("player_data['progression']" OR 'player_data["progression"]')
 ```
 
 #### PlayerDatastore.Read(player: Player, table_path: string): { [any]: any }?
@@ -70,7 +77,14 @@ PlayerDatastore.Read(player, "player_data.progression") -- // { ["Coins"] = 500 
 Exactly the same as **ApplyOperator** except it's not player-bound, meaning it doesn't have a player param
 
 ```lua
-PlayerDatastore.ApplyOperatorGlobal({ value_name = "unordered_map", operator = "INSERT", value = { ["K"] = "V" } })
+PlayerDatastore.ApplyOperatorGlobal({
+	value_name = "unordered_map",
+	value = function(currentValue)
+		local updatedValue = table.clone(currentValue)
+		updatedValue.K = "V"
+		return updatedValue
+	end
+})
 ```
 
 #### PlayerDatastore.ReadGlobal(path: string): any
@@ -81,21 +95,14 @@ Read function for non player-bound data.
 PlayerDatastore.ReadGlobal("unordered_map") -- // { ["K"] = "V" }
 ```
 
-### Operators:
+### Custom Operations:
 
-All available operator types:
-
-```lua
-export type ValueOperators = "+" | "-" | "*" | "/" | "SET" | "INSERT" | "PUSH" | "DELETE"
-```
-
-Operator structure:
+The custom transform receives the current value at `value_name` and must return the replacement value:
 
 ```lua
 export type OperationType = {
 	value_name: string,
-	operator: ValueOperators,
-	value: any
+	value: (currentValue: any) -> any
 }
 ```
 
