@@ -949,11 +949,10 @@ local function shardTable(getTbl: () -> { [any]: any }, setTbl: (value: any) -> 
 			shards[shardIndex] = current
 		end
 
-		local actualCount = 0
 		for index, shard in shards do
-			actualCount = index
 			PlayerDatastore.ShardData[keyFn(index)] = shard
 		end
+		local actualCount = #shards
 
 		setTbl({ __sharded = true, count = actualCount })
 	else

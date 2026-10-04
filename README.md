@@ -57,9 +57,8 @@ This is for non-global fields. **When a table is sharded, it: Unshards, applies 
 PlayerDatastore.Write(player, {
 	path = "player_data.progression",
 	transform = function(currentValue)
-		local updatedValue = table.clone(currentValue)
-		updatedValue.Coins = 500
-		return updatedValue
+		currentValue.Coins = 500
+		return currentValue
 	end
 }) -- // "player_data.progression" can also be ("player_data['progression']" OR 'player_data["progression"]')
 ```
@@ -80,9 +79,8 @@ Exactly the same as **Write** except it is not player-bound, so it does not take
 PlayerDatastore.WriteGlobal({
 	path = "unordered_map",
 	transform = function(currentValue)
-		local updatedValue = table.clone(currentValue)
-		updatedValue.K = "V"
-		return updatedValue
+		currentValue.K = "V"
+		return currentValue
 	end
 })
 ```
