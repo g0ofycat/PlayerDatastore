@@ -22,14 +22,17 @@ export type MetaData = {
 
 export type SnapshotEntry = {
 	Path: string,
-	Data: { [any]: any },
+	Data: { [any]: any }?, -- // nil in the index; stored under its own key
 	Timestamp: number,
-	Version: string
+	Version: string,
+	Key: string? -- // DataStore key holding the full entry
 }
 
 export type MetadataSnapshotEntry = { Key: string, Timestamp: number }
 
 export type SessionEntry = { JobID: string, Timestamp: number }
+
+export type MemoryEntry = { v: number, d: any? } -- // v: version bumped on every write; d: value, nil = deleted
 
 export type MigrationFunction = (Data: { [any]: any }) -> { [any]: any }
 

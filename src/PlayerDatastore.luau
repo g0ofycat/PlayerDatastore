@@ -20,7 +20,6 @@ PlayerDatastore.DirtyData = {} :: { [number | string]: boolean }
 PlayerDatastore.CurrentVersion = "v.1.0.0" -- // Used to track metadata version and migrations
 
 PlayerDatastore._initialized = false
-PlayerDatastore._localAheadOfMemory = false
 
 PlayerDatastore._globalDataWaiters = {} :: { thread }
 
@@ -47,6 +46,7 @@ local Types = require("./Utility/Types")
 
 PlayerDatastore.MetaData = {} :: { [number | string]: Types.MetaData }
 PlayerDatastore.Migrations = {} :: { [string]: { To: string, Fn: Types.MigrationFunction } }
+PlayerDatastore.StoredGlobalVersions = {} :: { [string]: number }
 
 PlayerDatastore.Presets = nil :: Types.PresetOptions?
 
@@ -220,6 +220,20 @@ local function getPresetFields(): ({ string }, { string })
 	return PlayerDatastore.Presets and PlayerDatastore.Presets.ShardedFields or {}, PlayerDatastore.Presets and PlayerDatastore.Presets.GlobalFields or {}
 end
 
+-- matchGlobalField(): Finds the configured global field a path starts with
+-- @param path: Global path
+-- @return: string?: The matched global field
+local function matchGlobalField(path: string): string?
+	local _, globalFields = getPresetFields()
+	for _, globalPath in globalFields do
+		local suffix = path:sub(#globalPath + 1)
+		if path:sub(1, #globalPath) == globalPath and (suffix == "" or suffix:sub(1, 1) == "." or suffix:sub(1, 1) == "[") then
+			return globalPath
+		end
+	end
+	return nil
+end
+
 -- findShardedPath(): Finds the sharded path for a value
 -- @param data: { [any]: any }
 -- @param valueName: string
@@ -276,43 +290,67 @@ end
 -- // PRIVATE MEMORY STORE API
 --=========================
 
--- readMemoryGlobal(): Reads the global data key from MemoryStore
--- @return: { [string]: any }?, boolean
-local function readMemoryGlobal(): ({ [string]: any }?, boolean)
-	local data: { [string]: any }? = nil
-
-	local success = pcall(function()
-		data = GlobalMemoryStore:GetAsync(Config.DATASTORE.MEMORY_STORE_KEY)
+-- readMemoryField(): Reads one global field's entry from MemoryStore
+-- @param field: Configured global field
+-- @return: (Types.MemoryEntry?, boolean): The entry; Whether the read succeeded
+local function readMemoryField(field: string): (Types.MemoryEntry?, boolean)
+	local success, entry = pcall(function()
+		return GlobalMemoryStore:GetAsync(`{Config.DATASTORE.MEMORY_STORE_KEY}:{field}`)
 	end)
 
 	if not success then
-		warn("readMemoryGlobal(): Failed to read from MemoryStore")
-		return nil, success
+		warn("readMemoryField(): Failed to read", field, "from MemoryStore")
+		return nil, false
 	end
 
-	return data, success
+	return entry, true
 end
 
--- writeMemoryGlobal(): Atomically updates the global data key in MemoryStore
--- @param callback: (current: { [string]: any }) -> { [string]: any }: Transform function
--- @return: (boolean, boolean): Whether the write succeeded; Whether the write committed
-local function writeMemoryGlobal(callback: (current: { [string]: any }) -> { [string]: any }?): (boolean, boolean)
-    local committed = false
+-- readMemoryGlobal(): Reads every configured global field's entry from MemoryStore
+-- @return: ({ [string]: any }, { [string]: number }, boolean): Values and versions of fields with an entry; Whether every read succeeded
+local function readMemoryGlobal(): ({ [string]: any }, { [string]: number }, boolean)
+	local values: { [string]: any }, versions: { [string]: number } = {}, {}
+	local _, globalFields = getPresetFields()
 
-    local success = pcall(function()
-        GlobalMemoryStore:UpdateAsync(Config.DATASTORE.MEMORY_STORE_KEY, function(current)
-            local state = current or {}
-            local result = callback(state)
-            committed = result ~= nil
-            return result
-        end, Config.DATASTORE.MEMORY_STORE_TTL)
-    end)
+	for _, field in globalFields do
+		local entry, success = readMemoryField(field)
+		if not success then return values, versions, false end
+		if entry then
+			values[field] = entry.d
+			versions[field] = entry.v
+		end
+	end
 
-    if not success then
-        warn("writeMemoryGlobal(): Failed to write to MemoryStore")
-    end
+	return values, versions, true
+end
 
-    return success, committed
+-- writeMemoryField(): Atomically transforms one global field's entry in MemoryStore
+-- @param field: Configured global field
+-- @param transform: (current: Types.MemoryEntry?) -> Types.MemoryEntry?: Returns the new entry, or nil to cancel
+-- @return: (boolean, boolean, Types.MemoryEntry?): Whether the write succeeded; Whether the write committed; The committed entry
+local function writeMemoryField(field: string, transform: (current: Types.MemoryEntry?) -> Types.MemoryEntry?): (boolean, boolean, Types.MemoryEntry?)
+	local committed: Types.MemoryEntry? = nil
+
+	local success = pcall(function()
+		GlobalMemoryStore:UpdateAsync(`{Config.DATASTORE.MEMORY_STORE_KEY}:{field}`, function(current)
+			committed = transform(current)
+			if committed then
+				local encoded = HttpService:JSONEncode(committed)
+				if #encoded > Config.DATASTORE.MEMORY_STORE_VALUE_LIMIT then
+					warn("writeMemoryField(): Global entry exceeds 32KB MemoryStore limit; write cancelled")
+					committed = nil
+				end
+			end
+			return committed
+		end, Config.DATASTORE.MEMORY_STORE_TTL)
+	end)
+
+	if not success then
+		warn("writeMemoryField(): Failed to write", field, "to MemoryStore")
+		return false, false, nil
+	end
+
+	return true, committed ~= nil, committed
 end
 
 --=========================
@@ -404,8 +442,13 @@ local function saveMetaData(user_id: number, player_name: string): boolean
         DataVersion = updated.DataVersion
     }
 
+	local encoded = HttpService:JSONEncode(toPersist)
+	if #encoded > 4 * 1024 * 1024 then
+		error("saveMetaData(): Metadata size exceeds Roblox 4 MB DataStore limit")
+	end
+
     local success = pcall(function()
-		PlayerMetaDataStore:SetAsync(getMetaKey(user_id), HttpService:JSONEncode(toPersist))
+		PlayerMetaDataStore:SetAsync(getMetaKey(user_id), encoded)
     end)
 
     if success then
@@ -466,10 +509,9 @@ end
 -- @param user_id: number | string
 -- @return: { [string]: Types.SnapshotEntry }
 local function loadSnapshots(user_id: number | string): { [string]: Types.SnapshotEntry }
-	local data: string? = nil
-
-	local success = pcall(function()
-		data = SnapshotDataStore:GetAsync(getSnapshotKey(user_id))
+	local success, snapshots = pcall(function()
+		local data = SnapshotDataStore:GetAsync(getSnapshotKey(user_id))
+		return data and HttpService:JSONDecode(data) or {}
 	end)
 
 	if not success then
@@ -477,7 +519,7 @@ local function loadSnapshots(user_id: number | string): { [string]: Types.Snapsh
 		return {}
 	end
 
-	return data and HttpService:JSONDecode(data) or {}
+	return snapshots
 end
 
 -- updateSnapshots(): Atomically updates the snapshots for a user
@@ -487,10 +529,16 @@ end
 local function updateSnapshots(user_id: number | string, updater: (snapshots: { [string]: Types.SnapshotEntry }) -> { [string]: Types.SnapshotEntry }): boolean
 	local limit = Config.DATASTORE.MAX_SNAPSHOTS_PER_KEY
 	local key = getSnapshotKey(user_id)
+	local evicted: { string } = {}
 
 	local success = pcall(function()
 		SnapshotDataStore:UpdateAsync(key, function(existing: string?): string?
+			evicted = {}
 			local snapshots: { [string]: Types.SnapshotEntry } = existing and HttpService:JSONDecode(existing) or {}
+			local dataKeys: { [string]: string } = {}
+			for name, entry in snapshots do
+				if entry.Key then dataKeys[name] = entry.Key end
+			end
 			snapshots = updater(snapshots)
 
 			local entries: { Types.MetadataSnapshotEntry } = {}
@@ -506,15 +554,50 @@ local function updateSnapshots(user_id: number | string, updater: (snapshots: { 
 				end
 			end
 
+			for name, dataKey in dataKeys do
+				if not snapshots[name] or snapshots[name].Key ~= dataKey then
+					table.insert(evicted, dataKey)
+				end
+			end
+
 			return HttpService:JSONEncode(snapshots)
 		end)
 	end)
 
 	if not success then
 		warn("updateSnapshots(): Failed for", user_id)
+		return false
 	end
 
-	return success
+	for _, dataKey in evicted do
+		pcall(function()
+			SnapshotDataStore:RemoveAsync(dataKey)
+		end)
+	end
+
+	return true
+end
+
+-- saveSnapshot(): Saves a snapshot under its own key, then adds it to the snapshot index
+-- @param user_id: number | string
+-- @param name: string
+-- @param entry: Types.SnapshotEntry
+-- @return: boolean: Whether the snapshot was saved and indexed
+local function saveSnapshot(user_id: number | string, name: string, entry: Types.SnapshotEntry): boolean
+	local dataKey = `snapshot:{HttpService:GenerateGUID(false)}`
+	local success = pcall(function()
+		SnapshotDataStore:SetAsync(dataKey, HttpService:JSONEncode(entry))
+	end)
+
+	if not success then
+		warn("saveSnapshot(): Failed to save snapshot data for", user_id, name)
+		return false
+	end
+
+	return updateSnapshots(user_id, function(snapshots)
+		snapshots[name] = { Path = entry.Path, Timestamp = entry.Timestamp, Version = entry.Version, Key = dataKey }
+		return snapshots
+	end)
 end
 
 -- runMigrations(): Runs all applicable migrations on a players data
@@ -541,15 +624,12 @@ local function runMigrations(player: Player, data: { [any]: any }, loadedVersion
 
 		local snapshotKey = `pre-migration:{currentVersion}:{HttpService:GenerateGUID(false)}`
 
-		local saved = updateSnapshots(player.UserId, function(snapshots)
-			snapshots[snapshotKey] = {
-				Path = "",
-				Data = deepClone(migrated),
-				Timestamp = os.time(),
-				Version = currentVersion
-			}
-			return snapshots
-		end)
+		local saved = saveSnapshot(player.UserId, snapshotKey, {
+			Path = "",
+			Data = deepClone(migrated),
+			Timestamp = os.time(),
+			Version = currentVersion
+		})
 
 		if not saved then
 			warn("runMigrations(): Aborting migration for", player.Name, "; could not save pre-migration snapshot")
@@ -681,8 +761,13 @@ local function persistShardFields(
 				return false
 			end
 
+			local encodedShard = HttpService:JSONEncode(shardData)
+			if #encodedShard > 4 * 1024 * 1024 then
+				error("persistShardFields(): Shard exceeds Roblox 4 MB DataStore limit")
+			end
+
 			local success = pcall(function()
-				ShardedDataStore:SetAsync(shardKey, HttpService:JSONEncode(shardData))
+				ShardedDataStore:SetAsync(shardKey, encodedShard)
 			end)
 			if not success then
 				warn("persistShardFields(): Failed to persist shard", shardKey)
@@ -692,6 +777,141 @@ local function persistShardFields(
 	end
 
 	return true
+end
+
+--=========================
+-- // PRIVATE SESSION LOCK API
+--=========================
+
+-- getSessionLockKey(): Returns the session lock key for a given user_id
+-- @param user_id: number
+-- @return: string
+local function getSessionLockKey(user_id: number): string
+	return `session:{user_id}:lock`
+end
+
+-- acquireSessionLock(): Atomically acquires a session lock for a player
+-- @param user_id: number
+-- @return: (boolean, Types.SessionLockReturnType): Whether the lock was acquired; reason ("OK" | "CONTESTED" | "ERROR")
+local function acquireSessionLock(user_id: number): (boolean, Types.SessionLockReturnType)
+	local lockKey = getSessionLockKey(user_id)
+
+	for _ = 1, Config.DATASTORE.LOCK_MAX_RETRIES do
+		local acquired = false
+		local contested = false
+		local lock: Types.SessionEntry? = nil
+		local success = pcall(function()
+			lock = SessionLockStore:UpdateAsync(lockKey, function(existing: Types.SessionEntry?): Types.SessionEntry?
+				if existing then
+					local isOurs = existing.JobID == game.JobId
+					local isStale = (os.time() - (existing.Timestamp or 0)) > Config.DATASTORE.LOCK_STALE_THRESHOLD
+
+					if not isOurs and not isStale then
+						contested = true
+						return nil
+					end
+				end
+
+				acquired = true
+				return { JobID = game.JobId, Timestamp = os.time() }
+			end)
+		end)
+
+		if success and acquired and lock and lock.JobID == game.JobId then
+			PlayerDatastore.SessionLockLost[user_id] = nil
+			PlayerDatastore.SessionLockHeartbeats[user_id] = true
+			task.spawn(function()
+				while PlayerDatastore.SessionLockHeartbeats[user_id] do
+					task.wait(math.max(1, Config.DATASTORE.LOCK_STALE_THRESHOLD / 3))
+					if not PlayerDatastore.SessionLockHeartbeats[user_id] then break end
+
+					local renewed = false
+					local lost = false
+					for attempt = 1, Config.DATASTORE.LOCK_MAX_RETRIES do
+						local renewedLock: Types.SessionEntry? = nil
+						local belongsElsewhere = false
+						local renewalSuccess = pcall(function()
+							renewedLock = SessionLockStore:UpdateAsync(lockKey, function(existing: Types.SessionEntry?): Types.SessionEntry?
+								if existing and existing.JobID ~= game.JobId then
+									belongsElsewhere = true
+									return nil
+								end
+								return { JobID = game.JobId, Timestamp = os.time() }
+							end)
+						end)
+
+						if renewalSuccess and renewedLock and renewedLock.JobID == game.JobId then
+							renewed = true
+							break
+						end
+						if belongsElsewhere or (renewedLock and renewedLock.JobID ~= game.JobId) then
+							lost = true
+							break
+						end
+						if attempt < Config.DATASTORE.LOCK_MAX_RETRIES then
+							task.wait(Config.DATASTORE.LOCK_RETRY_INTERVAL)
+						end
+					end
+
+					if lost or not renewed then
+						PlayerDatastore.SessionLockHeartbeats[user_id] = nil
+						PlayerDatastore.SessionLockLost[user_id] = true
+						local player = Players:GetPlayerByUserId(user_id)
+						if player then
+							warn("acquireSessionLock(): Could not renew session lock for", player.Name)
+							player:Kick("[PlayerDatastore]: Your data session could not be secured. Please rejoin.")
+						end
+						break
+					end
+				end
+			end)
+
+			return true, "OK"
+		end
+		if success and contested then return false, "CONTESTED" end
+
+		task.wait(Config.DATASTORE.LOCK_RETRY_INTERVAL)
+	end
+
+	return false, "ERROR"
+end
+
+-- renewSessionLock(): Renews or verifies the session lock before saving
+-- @param user_id: number
+-- @return: string: "OK" | "LOST" | "ERROR"
+local function renewSessionLock(user_id: number): string
+	local lockKey = getSessionLockKey(user_id)
+	local status = "ERROR"
+
+	local success = pcall(function()
+		SessionLockStore:UpdateAsync(lockKey, function(existing: Types.SessionEntry?): Types.SessionEntry?
+			if existing and existing.JobID ~= game.JobId then
+				status = "LOST"
+				return nil
+			end
+			status = "OK"
+			return { JobID = game.JobId, Timestamp = os.time() }
+		end)
+	end)
+
+	if not success then
+		warn("renewSessionLock(): Failed to renew session lock for", user_id)
+		return "ERROR"
+	end
+
+	return status
+end
+
+-- releaseSessionLock(): Releases the session lock for a player
+-- @param user_id: number
+function releaseSessionLock(user_id: number): ()
+	PlayerDatastore.SessionLockHeartbeats[user_id] = nil
+	pcall(function()
+		SessionLockStore:UpdateAsync(getSessionLockKey(user_id), function(existing: Types.SessionEntry?): Types.SessionEntry?
+			if existing and existing.JobID == game.JobId then return { JobID = existing.JobID, Timestamp = 0 } end
+			return nil
+		end)
+	end)
 end
 
 --=========================
@@ -723,6 +943,14 @@ local function saveData(player: Player?, user_id: number?): boolean
 		PlayerDatastore.Shard(player, table_path, true)
 	end
 
+	local lockStatus = renewSessionLock(userId)
+	if lockStatus == "LOST" then
+		PlayerDatastore.SessionLockLost[userId] = true
+		warn("saveData(): Session lock is owned by another server; refusing to save", userId)
+		return false
+	end
+	if lockStatus == "ERROR" then return false end
+
 	if not persistShardFields(
 		shardedFields,
 		function(path) return table.find(globalFields, path) ~= nil end,
@@ -732,8 +960,15 @@ local function saveData(player: Player?, user_id: number?): boolean
 		return false
 	end
 
+	local encodedData = HttpService:JSONEncode(data)
+	if #encodedData > 4 * 1024 * 1024 then
+		error("saveData(): Player data payload exceeds Roblox 4 MB DataStore limit")
+	end
+
 	local success = pcall(function()
-		PlayerDataStore:SetAsync(tostring(userId), HttpService:JSONEncode(data))
+		PlayerDataStore:UpdateAsync(tostring(userId), function(existing: string?): string?
+			return encodedData
+		end)
 	end)
 
 	if not success then
@@ -769,39 +1004,13 @@ end
 local function saveGlobalData(): boolean
 	local shardedFields, globalFields = getPresetFields()
 
-	local liveData: { [string]: any }? = nil
-	if not PlayerDatastore._localAheadOfMemory then
-		local memoryReadSucceeded: boolean
-		liveData, memoryReadSucceeded = readMemoryGlobal()
-		if not memoryReadSucceeded then return false end
-	end
+	local liveData, versions, memoryReadSucceeded = readMemoryGlobal()
+	if not memoryReadSucceeded then return false end
     local dataToSave = {}
 
     for _, path in globalFields do
-        local value: any = nil
-
-		if liveData and readGlobalField(liveData, path) ~= nil then
-			value = readGlobalField(liveData, path)
-        else
-			local tbl = resolvePath(PlayerDatastore.GlobalData, path)
-            if isSharded(tbl) then
-                local combined = {}
-                for i = 1, tbl.count or 0 do
-                    local shardKey = getShardGlobalKey(path, i)
-                    local shardData = PlayerDatastore.ShardData[shardKey]
-					if not shardData then
-						warn("saveGlobalData(): Missing shard", shardKey)
-						return false
-					end
-					for k, v in shardData do
-						combined[k] = v
-                    end
-                end
-                value = combined
-            else
-                value = tbl
-            end
-        end
+		if versions[path] == nil then continue end
+		local value: any = liveData[path]
 
         if value == nil then continue end
 
@@ -826,10 +1035,17 @@ local function saveGlobalData(): boolean
 	end
 
 	local success = pcall(function()
-        GlobalDataStore:SetAsync(
-            Config.DATASTORE.GLOBAL_DATASTORE_KEY,
-            HttpService:JSONEncode(dataToSave)
-        )
+		GlobalDataStore:UpdateAsync(Config.DATASTORE.GLOBAL_DATASTORE_KEY, function(encoded: string?): string?
+			local stored = encoded and HttpService:JSONDecode(encoded) or {}
+			stored.__v = stored.__v or {} -- // { [field]: version }; data saved before versioning counts as 0
+			for path, version in versions do
+				if (stored.__v[path] or 0) > version then continue end
+				stored[path] = dataToSave[path]
+				stored.__v[path] = version
+			end
+			PlayerDatastore.StoredGlobalVersions = stored.__v
+			return HttpService:JSONEncode(stored)
+		end)
     end)
 
     if not success then
@@ -1006,7 +1222,19 @@ local function flushDirty(max_keys: number?): number
 		["number"] = function(Key: number | string): boolean
 			local userId = Key :: number
 			if not PlayerDatastore.PlayerData[userId] then return true end
-			return saveData(Players:GetPlayerByUserId(userId), userId)
+			local player = Players:GetPlayerByUserId(userId)
+			if not player and PlayerDatastore.SessionLockLost[userId] then
+				PlayerDatastore.PlayerData[userId] = nil
+				PlayerDatastore.MetaData[userId] = nil
+				return true
+			end
+			if not saveData(player, userId) then return false end
+			if not Players:GetPlayerByUserId(userId) then
+				releaseSessionLock(userId)
+				PlayerDatastore.PlayerData[userId] = nil
+				PlayerDatastore.MetaData[userId] = nil
+			end
+			return true
 		end,
 
 		["string"] = function(_Key: number | string): boolean
@@ -1037,120 +1265,11 @@ local function startAutosave(): ()
 	task.spawn(function()
 		while true do
 			task.wait(math.max(1, Config.DATASTORE.MEMORY_STORE_TTL / 3))
-			writeMemoryGlobal(function(current)
-				if next(current) == nil then return nil end
-				return current
-			end)
+			local _, globalFields = getPresetFields()
+			for _, field in globalFields do
+				writeMemoryField(field, function(current) return current end)
+			end
 		end
-	end)
-end
-
---=========================
--- // PRIVATE SESSION LOCK API
---=========================
-
--- getSessionLockKey(): Returns the session lock key for a given user_id
--- @param user_id: number
--- @return: string
-local function getSessionLockKey(user_id: number): string
-	return `session:{user_id}:lock`
-end
-
--- acquireSessionLock(): Atomically acquires a session lock for a player
--- @param user_id: number
--- @return: (boolean, Types.SessionLockReturnType): Whether the lock was acquired; reason ("OK" | "CONTESTED" | "ERROR")
-local function acquireSessionLock(user_id: number): (boolean, Types.SessionLockReturnType)
-	local lockKey = getSessionLockKey(user_id)
-
-	for _ = 1, Config.DATASTORE.LOCK_MAX_RETRIES do
-		local acquired = false
-		local contested = false
-		local lock: Types.SessionEntry? = nil
-		local success = pcall(function()
-			lock = SessionLockStore:UpdateAsync(lockKey, function(existing: Types.SessionEntry?): Types.SessionEntry?
-				if existing then
-					local isOurs = existing.JobID == game.JobId
-					local isStale = (os.time() - (existing.Timestamp or 0)) > Config.DATASTORE.LOCK_STALE_THRESHOLD
-
-					if not isOurs and not isStale then
-						contested = true
-						return nil
-					end
-				end
-
-				acquired = true
-				return { JobID = game.JobId, Timestamp = os.time() }
-			end)
-		end)
-
-		if success and acquired and lock and lock.JobID == game.JobId then
-			PlayerDatastore.SessionLockLost[user_id] = nil
-			PlayerDatastore.SessionLockHeartbeats[user_id] = true
-			task.spawn(function()
-				while PlayerDatastore.SessionLockHeartbeats[user_id] do
-					task.wait(math.max(1, Config.DATASTORE.LOCK_STALE_THRESHOLD / 3))
-					if not PlayerDatastore.SessionLockHeartbeats[user_id] then break end
-
-					local renewed = false
-					local lost = false
-					for attempt = 1, Config.DATASTORE.LOCK_MAX_RETRIES do
-						local renewedLock: Types.SessionEntry? = nil
-						local belongsElsewhere = false
-						local renewalSuccess = pcall(function()
-							renewedLock = SessionLockStore:UpdateAsync(lockKey, function(existing: Types.SessionEntry?): Types.SessionEntry?
-								if existing and existing.JobID ~= game.JobId then
-									belongsElsewhere = true
-									return nil
-								end
-								return { JobID = game.JobId, Timestamp = os.time() }
-							end)
-						end)
-
-						if renewalSuccess and renewedLock and renewedLock.JobID == game.JobId then
-							renewed = true
-							break
-						end
-						if belongsElsewhere or (renewedLock and renewedLock.JobID ~= game.JobId) then
-							lost = true
-							break
-						end
-						if attempt < Config.DATASTORE.LOCK_MAX_RETRIES then
-							task.wait(Config.DATASTORE.LOCK_RETRY_INTERVAL)
-						end
-					end
-
-					if lost or not renewed then
-						PlayerDatastore.SessionLockHeartbeats[user_id] = nil
-						PlayerDatastore.SessionLockLost[user_id] = true
-						local player = Players:GetPlayerByUserId(user_id)
-						if player then
-							warn("acquireSessionLock(): Could not renew session lock for", player.Name)
-							player:Kick("[PlayerDatastore]: Your data session could not be secured. Please rejoin.")
-						end
-						break
-					end
-				end
-			end)
-
-			return true, "OK"
-		end
-		if success and contested then return false, "CONTESTED" end
-
-		task.wait(Config.DATASTORE.LOCK_RETRY_INTERVAL)
-	end
-
-	return false, "ERROR"
-end
-
--- releaseSessionLock(): Releases the session lock for a player
--- @param user_id: number
-local function releaseSessionLock(user_id: number): ()
-	PlayerDatastore.SessionLockHeartbeats[user_id] = nil
-	pcall(function()
-		SessionLockStore:UpdateAsync(getSessionLockKey(user_id), function(existing: Types.SessionEntry?): Types.SessionEntry?
-			if existing and existing.JobID == game.JobId then return nil end
-			return existing
-		end)
 	end)
 end
 
@@ -1434,7 +1553,7 @@ local function onGlobalSetup(data_table: { [any]: any }, globalFields: { string 
 		PlayerDatastore.MetaData[Config.DATASTORE.GLOBAL_DATASTORE_KEY] = globalMeta
 	end
 
-	local globalMemoryState = {}
+	local globalMemoryState: { [string]: any } = {}
 	local shardLoadFailed = false
 
 	for _, table_path in globalFields do
@@ -1500,43 +1619,37 @@ local function onGlobalSetup(data_table: { [any]: any }, globalFields: { string 
 			end
 		end
 
-		setGlobalField(globalMemoryState, table_path, reconciled)
+		globalMemoryState[table_path] = reconciled
 	end
 
 	if shardLoadFailed then
 		return false
 	end
 
-	local syncedFromMemory: { [string]: any }? = nil
+	local storedVersions = globalData.__v or {}
+	PlayerDatastore.StoredGlobalVersions = storedVersions
 
-	writeMemoryGlobal(function(current): { [string]: any }?
-		if not current or next(current) == nil then
-			return globalMemoryState
-		end
+	for table_path, reconciled in globalMemoryState do
+		local syncedFromMemory: Types.MemoryEntry? = nil
 
-		syncedFromMemory = current
+		writeMemoryField(table_path, function(current): Types.MemoryEntry?
+			syncedFromMemory = current
+			if current then return nil end
+			return { v = PlayerDatastore.StoredGlobalVersions[table_path] or 0, d = reconciled }
+		end)
 
-		return nil
-	end)
+		if not syncedFromMemory then continue end
 
-	if syncedFromMemory then
-		local diskCounts: { [string]: number } = {}
-		for _, table_path in globalFields do
-			local tbl = resolvePath(PlayerDatastore.GlobalData, table_path)
-			if isSharded(tbl) then
-				diskCounts[table_path] = tbl.count or 0
-			end
-		end
+		local tbl = resolvePath(PlayerDatastore.GlobalData, table_path)
+		local oldCount = if isSharded(tbl) then tbl.count or 0 else 0
 
-		syncGlobalFromMemory(syncedFromMemory, globalFields, shardedFields, true)
+		syncGlobalFromMemory({ [table_path] = syncedFromMemory.d }, { table_path }, shardedFields, true)
 
-		for table_path, oldCount in diskCounts do
-			local newTbl = resolvePath(PlayerDatastore.GlobalData, table_path)
-			local newCount = isSharded(newTbl) and (newTbl.count or 0) or 0
+		local newTbl = resolvePath(PlayerDatastore.GlobalData, table_path)
+		local newCount = isSharded(newTbl) and (newTbl.count or 0) or 0
 
-			for i = newCount + 1, oldCount do
-				PlayerDatastore.ShardData[getShardGlobalKey(table_path, i)] = nil
-			end
+		for i = newCount + 1, oldCount do
+			PlayerDatastore.ShardData[getShardGlobalKey(table_path, i)] = nil
 		end
 	end
 
@@ -1597,28 +1710,44 @@ function PlayerDatastore.Init(data_table: { [any]: any }, presets: Types.PresetO
 	end)
 
 	game:BindToClose(function()
+		local activeThreads = {}
 		for _, player in Players:GetPlayers() do
-			if not PlayerDatastore.PlayerData[player.UserId] then
-				releaseSessionLock(player.UserId)
-				continue
-			end
+			table.insert(activeThreads, task.spawn(function()
+				local userId = player.UserId
+				if not PlayerDatastore.PlayerData[userId] then
+					releaseSessionLock(userId)
+					return
+				end
 
-			local saved: boolean
-			if PlayerDatastore.DirtyData[player.UserId] then
-				saved = saveData(player, player.UserId)
-			else
-				saved = saveMetaData(player.UserId, player.Name)
-			end
+				local saved: boolean
+				if PlayerDatastore.DirtyData[userId] then
+					saved = saveData(player, userId)
+				else
+					saved = saveMetaData(userId, player.Name)
+				end
 
-			if saved then
-				PlayerDatastore.DirtyData[player.UserId] = nil
-				releaseSessionLock(player.UserId)
-			else
-				markDirty(player.UserId)
-				warn("BindToClose: Could not fully save data for", player.Name)
-			end
+				if saved then
+					PlayerDatastore.DirtyData[userId] = nil
+					releaseSessionLock(userId)
+				else
+					markDirty(userId)
+				end
 
-			cleanupWriteQueues(player.UserId)
+				cleanupWriteQueues(userId)
+			end))
+		end
+
+		local startTime = os.clock()
+		while true do
+			local allDone = true
+			for _, thread in activeThreads do
+				if coroutine.status(thread) ~= "dead" then
+					allDone = false
+					break
+				end
+			end
+			if allDone or (os.clock() - startTime > 15) then break end
+			task.wait(0.2)
 		end
 
 		for attempt = 1, Config.DATASTORE.LOCK_MAX_RETRIES do
@@ -1834,14 +1963,24 @@ end
 -- DeleteGlobalData(): Deletes a global data key and its shards
 -- @param path: The global key to delete
 -- @note: This almost should NEVER be used, proceed with caution
-function PlayerDatastore.DeleteGlobalData(path: string): ()
+-- @return: boolean: Whether the deletion was committed to MemoryStore
+function PlayerDatastore.DeleteGlobalData(path: string): boolean
 	yieldGlobalData()
 
 	local _, globalFields = getPresetFields()
 
 	if not table.find(globalFields, path) then
 		warn("DeleteGlobalData(): Path is not a valid global field:", path)
-		return
+		return false
+	end
+
+	local memorySuccess, memoryCommitted = writeMemoryField(path, function(current): Types.MemoryEntry?
+		return { v = math.max(current and current.v or 0, PlayerDatastore.StoredGlobalVersions[path] or 0) + 1 }
+	end)
+
+	if not memorySuccess or not memoryCommitted then
+		warn("DeleteGlobalData(): Deletion was not committed to MemoryStore; not applied")
+		return false
 	end
 
 	local tbl = resolvePath(PlayerDatastore.GlobalData, path)
@@ -1855,22 +1994,11 @@ function PlayerDatastore.DeleteGlobalData(path: string): ()
 	setGlobalField(PlayerDatastore.GlobalData, path, nil)
 	PlayerDatastore.MetaData[path] = nil
 
-	local memorySuccess, memoryCommitted = writeMemoryGlobal(function(current): { [string]: any }
-		setGlobalField(current, path, nil)
-		return current
-	end)
-
-	if not memorySuccess then
-		PlayerDatastore._localAheadOfMemory = true
-	elseif not memoryCommitted then
-		warn("DeleteGlobalData(): Deletion was not committed to MemoryStore")
-		return
-	end
-
 	markDirty(Config.DATASTORE.GLOBAL_DATASTORE_KEY)
 	if saveGlobalData() then
 		PlayerDatastore.DirtyData[Config.DATASTORE.GLOBAL_DATASTORE_KEY] = nil
 	end
+	return true
 end
 
 --=========================
@@ -1944,56 +2072,32 @@ end
 function PlayerDatastore.ReadGlobal(path: string): any
     yieldGlobalData()
 
-    if PlayerDatastore._localAheadOfMemory then
-        return readGlobalLocalFallback(path)
-    end
+	local field = matchGlobalField(path)
+	local entry = if field then readMemoryField(field) else nil
+	if not field or not entry then
+		return readGlobalLocalFallback(path)
+	end
 
-    local liveData, fetchOk = readMemoryGlobal()
-
-    if not fetchOk then
-        warn("ReadGlobal(): MemoryStore fetch failed, falling back to local cache")
-        return readGlobalLocalFallback(path)
-    end
-
-    if not liveData then
-        return readGlobalLocalFallback(path)
-    end
-
+	local liveData = {}
+	setGlobalField(liveData, field, entry.d)
 	return readGlobalField(liveData, path)
 end
 
 -- WriteGlobal(): Applies a transform to a global value at a path
 -- @param write: Types.WriteType (path, transform)
-function PlayerDatastore.WriteGlobal(write: Types.WriteType): ()
+-- @return: boolean: Whether the write was committed to MemoryStore; nothing is applied otherwise
+function PlayerDatastore.WriteGlobal(write: Types.WriteType): boolean
 	yieldGlobalData()
 
-	local shardedFields, globalFields = getPresetFields()
-	local validGlobalPath = false
-	for _, globalPath in globalFields do
-		local suffix = write.path:sub(#globalPath + 1)
-		if write.path == globalPath or suffix:sub(1, 1) == "." or suffix:sub(1, 1) == "[" then
-			validGlobalPath = true
-			break
-		end
-	end
-
-	if not validGlobalPath then
+	local field = matchGlobalField(write.path)
+	if not field then
 		warn("WriteGlobal(): Path doesn't start with a valid global field:", write.path)
-		return
+		return false
 	end
 
-	local liveData: { [string]: any }? = nil
-
-	local success, committed = writeMemoryGlobal(function(current): { [string]: any }?
-		local base: { [string]: any }
-
-		base = {}
-		for _, path in globalFields do
-			local value = if PlayerDatastore._localAheadOfMemory then readGlobalLocalFallback(path) else readGlobalField(current, path)
-			if value ~= nil then
-				setGlobalField(base, path, value)
-			end
-		end
+	local success, committed, entry = writeMemoryField(field, function(current): Types.MemoryEntry?
+		local base = {}
+		setGlobalField(base, field, current and current.d)
 
 		local currentValue = resolvePath(base, write.path)
 		if currentValue == nil then
@@ -2002,53 +2106,19 @@ function PlayerDatastore.WriteGlobal(write: Types.WriteType): ()
 		end
 
 		setPath(base, write.path, write.transform(currentValue))
-		liveData = base
-		return base
+		return { v = (current and current.v or 0) + 1, d = resolvePath(base, field) }
 	end)
 
-	if not success then
-		PlayerDatastore._localAheadOfMemory = true
-
-		warn("WriteGlobal(): MemoryStore unavailable, applying to local cache only. State may differ across servers until MemoryStore recovers")
-
-		local shardedPath = findShardedPath(PlayerDatastore.GlobalData, write.path)
-		if shardedPath then
-			PlayerDatastore.ShardGlobal(shardedPath, false)
-			if isSharded(resolvePath(PlayerDatastore.GlobalData, shardedPath)) then
-				warn("WriteGlobal(): Missing shard for", shardedPath, "; write dropped")
-				return
-			end
-		end
-
-		local currentValue = resolvePath(PlayerDatastore.GlobalData, write.path)
-		if currentValue == nil then
-			warn("WriteGlobal(): Couldn't find value in local cache:", write.path)
-			if shardedPath then PlayerDatastore.ShardGlobal(shardedPath, true) end
-			return
-		end
-
-		setPath(PlayerDatastore.GlobalData, write.path, write.transform(currentValue))
-		if shardedPath then PlayerDatastore.ShardGlobal(shardedPath, true) end
-
-		markDirty(Config.DATASTORE.GLOBAL_DATASTORE_KEY)
-		return
+	if not success or not committed or not entry then
+		warn("WriteGlobal(): Write failed to commit to MemoryStore; write not applied")
+		return false
 	end
 
-	if not committed then
-		warn("WriteGlobal(): Write failed to commit; write not applied")
-		return
-	end
-
-	PlayerDatastore._localAheadOfMemory = false
-
-	if not liveData then
-		markDirty(Config.DATASTORE.GLOBAL_DATASTORE_KEY)
-		return
-	end
-
-	syncGlobalFromMemory(liveData, globalFields, shardedFields)
+	local shardedFields = getPresetFields()
+	syncGlobalFromMemory({ [field] = entry.d }, { field }, shardedFields)
 
 	markDirty(Config.DATASTORE.GLOBAL_DATASTORE_KEY)
+	return true
 end
 
 --=========================
@@ -2060,7 +2130,8 @@ end
 -- @return: { [any]: any }?
 function PlayerDatastore.GetPlayerData(player: Player): { [any]: any }?
 	yieldPlayerData(player.UserId)
-	return PlayerDatastore.PlayerData[player.UserId]
+	local data = PlayerDatastore.PlayerData[player.UserId]
+	return data and deepClone(data) or nil
 end
 
 -- GetShardData(): Gets a shards data
@@ -2069,15 +2140,17 @@ end
 -- @return: { [string]: any } | any
 function PlayerDatastore.GetShardData(player: Player, key: string?): { [string]: any } | any
 	yieldPlayerData(player.UserId)
-	return if key then PlayerDatastore.ShardData[key] else PlayerDatastore.ShardData
+	local shard = key and PlayerDatastore.ShardData[key] or PlayerDatastore.ShardData
+	return deepClone(shard)
 end
 
 -- GetGlobalData(): Gets the global data
 -- @param table_path?: The path to the table to get; else returns the entire table
 -- @return: { [string]: any } | any
 function PlayerDatastore.GetGlobalData(table_path: string?): { [string]: any } | any
-    yieldGlobalData()
-	return if table_path then resolvePath(PlayerDatastore.GlobalData, table_path) else PlayerDatastore.GlobalData
+	yieldGlobalData()
+	local data = table_path and resolvePath(PlayerDatastore.GlobalData, table_path) or PlayerDatastore.GlobalData
+	return deepClone(data)
 end
 
 --=========================
@@ -2135,11 +2208,11 @@ function PlayerDatastore.CreateSnapshot(name: string, path: string, player: Play
 		yieldGlobalData()
 		user_id = Config.DATASTORE.GLOBAL_DATASTORE_KEY
 
-		if PlayerDatastore._localAheadOfMemory then
-			value = readGlobalLocalFallback(path)
+		if path == "" then
+			local liveData, _, success = readMemoryGlobal()
+			value = if success then liveData else nil
 		else
-			local liveData, _ = readMemoryGlobal()
-			value = if liveData then readGlobalField(liveData, path) else readGlobalLocalFallback(path)
+			value = PlayerDatastore.ReadGlobal(path)
 		end
 	end
 
@@ -2155,10 +2228,7 @@ function PlayerDatastore.CreateSnapshot(name: string, path: string, player: Play
 		Version = PlayerDatastore.CurrentVersion
 	}
 
-	updateSnapshots(user_id :: number | string, function(snapshots)
-		snapshots[name] = snapshot
-		return snapshots
-	end)
+	saveSnapshot(user_id :: number | string, name, snapshot)
 end
 
 -- RestoreSnapshot(): Restores a named snapshot, overwriting current data at that path
@@ -2182,6 +2252,19 @@ function PlayerDatastore.RestoreSnapshot(name: string, player: Player?): ()
 		return
 	end
 
+	local snapshotData: any = snapshot.Data
+	if snapshotData == nil then
+		local success, stored = pcall(function()
+			local encoded = snapshot.Key and SnapshotDataStore:GetAsync(snapshot.Key)
+			return encoded and HttpService:JSONDecode(encoded)
+		end)
+		if not success or not stored then
+			warn("RestoreSnapshot(): Failed to load snapshot data:", name)
+			return
+		end
+		snapshotData = stored.Data
+	end
+
 	if player then
 		local data = PlayerDatastore.PlayerData[user_id :: number]
 		if not data then
@@ -2190,9 +2273,9 @@ function PlayerDatastore.RestoreSnapshot(name: string, player: Player?): ()
 		end
 
 		if snapshot.Path == "" then
-			PlayerDatastore.PlayerData[user_id :: number] = deepClone(snapshot.Data)
+			PlayerDatastore.PlayerData[user_id :: number] = deepClone(snapshotData)
 		else
-			setPath(data, snapshot.Path, deepClone(snapshot.Data))
+			setPath(data, snapshot.Path, deepClone(snapshotData))
 		end
 
 		local shardedFields, globalFields = getPresetFields()
@@ -2203,35 +2286,33 @@ function PlayerDatastore.RestoreSnapshot(name: string, player: Player?): ()
 
 		markDirty(user_id :: number | string)
 	else
-		local success, committed = writeMemoryGlobal(function(current): { [string]: any }
-			if snapshot.Path == "" then
-				return deepClone(snapshot.Data)
+		local shardedFields, globalFields = getPresetFields()
+		local matched = if snapshot.Path == "" then nil else matchGlobalField(snapshot.Path)
+		if snapshot.Path ~= "" and not matched then
+			warn("RestoreSnapshot(): Snapshot path is not a global field:", snapshot.Path)
+			return
+		end
+		local fields: { string } = if matched then { matched } else globalFields
+
+		for _, field in fields do
+			if snapshot.Path == "" and readGlobalField(snapshotData, field) == nil then continue end
+			local success, committed, entry = writeMemoryField(field, function(current): Types.MemoryEntry?
+				local base = if snapshot.Path == "" then deepClone(snapshotData) else {}
+				if snapshot.Path ~= "" then
+					setGlobalField(base, field, current and current.d)
+					setGlobalField(base, snapshot.Path, deepClone(snapshotData))
+				end
+				return { v = math.max(current and current.v or 0, PlayerDatastore.StoredGlobalVersions[field] or 0) + 1, d = readGlobalField(base, field) }
+			end)
+
+			if not success or not committed or not entry then
+				warn("RestoreSnapshot(): Global write failed to commit for", field, "; restore not applied")
+				return
 			end
 
-			setGlobalField(current, snapshot.Path, deepClone(snapshot.Data))
-
-			return current
-		end)
-
-		if not success then
-			warn("RestoreSnapshot(): Failed to restore global snapshot:", name)
-			return
+			syncGlobalFromMemory({ [field] = entry.d }, { field }, shardedFields)
+			markDirty(Config.DATASTORE.GLOBAL_DATASTORE_KEY)
 		end
-
-		if not committed then
-			warn("RestoreSnapshot(): Global write failed to commit; restore not applied")
-			return
-		end
-
-		PlayerDatastore._localAheadOfMemory = false
-
-		local liveData, _ = readMemoryGlobal()
-		if liveData then
-			local shardedFields, globalFields = getPresetFields()
-			syncGlobalFromMemory(liveData, globalFields, shardedFields)
-		end
-
-		markDirty(Config.DATASTORE.GLOBAL_DATASTORE_KEY)
 	end
 end
 

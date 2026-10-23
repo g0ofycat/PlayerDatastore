@@ -28,6 +28,7 @@ return {
 		LOCK_RETRY_INTERVAL = 2, -- // number: Time in seconds between each lock retry
 
 		MEMORY_STORE_TTL = 3600, -- // number: Time in seconds for MemoryStore entries to live before expiring
+		MEMORY_STORE_VALUE_LIMIT = 30000, -- // number: Max JSON bytes per global field MemoryStore entry; HashMap values cap at 32KB
 
 		LOCK_STALE_THRESHOLD = 120, -- // number: Time in seconds for a lock to be considered stale
 

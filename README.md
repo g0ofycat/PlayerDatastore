@@ -71,9 +71,9 @@ Read function for player-bound data.
 PlayerDatastore.Read(player, "player_data.progression") -- // { ["Coins"] = 500 }
 ```
 
-#### PlayerDatastore.WriteGlobal(write: Types.WriteType): ()
+#### PlayerDatastore.WriteGlobal(write: Types.WriteType): boolean
 
-Exactly the same as **Write** except it is not player-bound, so it does not take a player parameter.
+Exactly the same as **Write** except it is not player-bound, so it does not take a player parameter. Returns whether the write was committed to MemoryStore; if MemoryStore is unavailable the write is not applied anywhere.
 
 ```lua
 PlayerDatastore.WriteGlobal({
@@ -190,7 +190,8 @@ function PlayerDatastore.DeletePlayerData(player: Player): ()
 -- DeleteGlobalData(): Deletes a global data key and its shards
 -- @param path: The global key to delete
 -- @note: This almost should NEVER be used, proceed with caution
-function PlayerDatastore.DeleteGlobalData(path: string): ()
+-- @return: boolean: Whether the deletion was committed to MemoryStore; nothing is deleted otherwise
+function PlayerDatastore.DeleteGlobalData(path: string): boolean
 ```
 
 ### Utility:
@@ -269,6 +270,6 @@ function PlayerDatastore.DeleteSnapshot(name: string, player: Player?): ()
 ```lua
 -- ListSnapshots(): Lists all snapshots for a player or global
 -- @param player?: Player; if nil lists global snapshots
--- @return: { [string]: Types.SnapshotEntry }?
+-- @return: { [string]: Types.SnapshotEntry }?: Index entries (Path, Timestamp, Version, Key); Data is stored under Key and is only inline for legacy snapshots
 function PlayerDatastore.ListSnapshots(player: Player?): { [string]: Types.SnapshotEntry }?
 ```
