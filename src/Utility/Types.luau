@@ -36,6 +36,8 @@ export type MemoryEntry = { v: number, d: any? } -- // v: version bumped on ever
 
 export type MigrationFunction = (Data: { [any]: any }) -> { [any]: any }
 
+export type ShardWrite = { key: string, encoded: string }
+
 export type SessionLockReturnType = "OK" | "CONTESTED" | "ERROR"
 
 return nil

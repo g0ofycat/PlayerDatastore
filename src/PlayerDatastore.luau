@@ -8,7 +8,8 @@ PlayerDatastore.GlobalData = {} :: { [string]: any }
 
 PlayerDatastore.SessionLockHeartbeats = {} :: { [number]: boolean }
 PlayerDatastore.SessionLockLost = {} :: { [number]: boolean }
-PlayerDatastore.PendingShardRemovals = {} :: { [number | string]: { [string]: boolean? } }
+PlayerDatastore.PendingShardRemovals = {} :: { [number | string]: { [string]: number? } } -- // [owner][persistent shard key] = unix time it may be deleted
+PlayerDatastore.Committed = {} :: { [number]: { [string]: { ver: number?, count: number, stub: any } } } -- // [userId][path] = what the persisted master record references
 
 PlayerDatastore.WriteQueues = {} :: { [number]: { thread } }
 PlayerDatastore.LoadingQueues = {} :: { [number]: { thread } }
@@ -146,6 +147,8 @@ end
 local function getSegments(path: string): { any }
 	local segments = {}
 
+	-- // ([%[%.]?): { [ || . }
+	-- // ([^%[%]%.]+)%]?: { ! [, ] || .}
 	for isBracket, content in path:gmatch("([%[%.]?)([^%[%]%.]+)%]?") do
 		local bracketed = (isBracket == "[")
 		table.insert(segments, parseSegment(content :: string, bracketed))
@@ -269,8 +272,8 @@ local function yieldPlayerData(user_id: number): boolean
 		PlayerDatastore.LoadingQueues[user_id] = {}
 	end
 
-	table.insert(PlayerDatastore.LoadingQueues[user_id], coroutine.running())
-	coroutine.yield()
+	table.insert(PlayerDatastore.LoadingQueues[user_id], coroutine.running()) -- // capturing the current thread per user_id so i don't have to use some hacky while task.wait(...) schema
+	coroutine.yield() -- // suspend user_id thread so everything can be loaded, and i can resume when everything is loaded. same pattern is used in basically everything i need to yield
 
 	return PlayerDatastore.PlayerData[user_id] ~= nil
 end
@@ -689,44 +692,44 @@ local function stripGlobalFields(data_table: { [any]: any }, globalFields: { str
 	return clone
 end
 
--- queueShardRemovals(): Defers obsolete shard deletion until its master record saves
--- @param owner: Player user ID or global datastore key
--- @param oldCount: Previous shard count
--- @param newCount: Replacement shard count
--- @param keyFn: Builds a persistent shard key from its index
-local function queueShardRemovals(owner: number | string, oldCount: number, newCount: number, keyFn: (number) -> string): ()
-	local pending = PlayerDatastore.PendingShardRemovals[owner] or {}
-	for index = 1, newCount do
-		pending[keyFn(index)] = nil
-	end
-	for index = newCount + 1, oldCount do
-		pending[keyFn(index)] = true
-	end
-	if next(pending) then
-		PlayerDatastore.PendingShardRemovals[owner] = pending
-	else
-		PlayerDatastore.PendingShardRemovals[owner] = nil
-	end
+-- persistKey(): The DataStore key a shard is stored under
+-- @param shardKey: The in-memory key (getShardKey / getShardGlobalKey)
+-- @param ver: The stub's version. nil = legacy (stored under shardKey itself), 0/1 = a player's double-buffer slot, string = a global's generation
+-- @return: string
+-- @note: A save never overwrites the shards the committed master references, so a crash mid-save leaves the previous save intact
+local function persistKey(shardKey: string, ver: (number | string)?): string
+	if ver == nil then return shardKey end
+	return `{shardKey}:{ver}`
 end
 
--- cleanupPendingShardRemovals(): Removes queued obsolete shard keys after master save
+-- newGeneration(): Random id for one persisted version of a GLOBAL sharded table (several servers can save globals, so slots can't be used)
+-- @return: string
+local function newGeneration(): string
+	return HttpService:GenerateGUID(false):sub(1, 8)
+end
+
+-- cleanupPendingShardRemovals(): Removes queued shard keys whose delay has passed
 -- @param owner: Player user ID or global datastore key
--- @return: boolean: Whether every queued shard was removed
+-- @return: boolean: Whether every due removal succeeded
+-- @note: Best effort: queued keys are unreferenced by the committed master, so a failure here is not a failed save
 local function cleanupPendingShardRemovals(owner: number | string): boolean
 	local pending = PlayerDatastore.PendingShardRemovals[owner]
 	if not pending then return true end
 
+	local now = os.time()
 	local allSucceeded = true
-	for shardKey in pending do
+
+	for key, due in pending do
+		if (due or 0) > now then continue end
+
 		local success = pcall(function()
-			ShardedDataStore:RemoveAsync(shardKey)
+			ShardedDataStore:RemoveAsync(key)
 		end)
 		if success then
-			pending[shardKey] = nil
-			PlayerDatastore.ShardData[shardKey] = nil
+			pending[key] = nil
 		else
 			allSucceeded = false
-			warn("cleanupPendingShardRemovals(): Failed to remove", shardKey)
+			warn("cleanupPendingShardRemovals(): Failed to remove", key)
 		end
 	end
 
@@ -736,43 +739,102 @@ local function cleanupPendingShardRemovals(owner: number | string): boolean
 	return allSucceeded
 end
 
--- persistShardFields(): Persists all cached shards in the selected fields
+-- queueShardRemovals(): Queues persisted shards that the master record no longer references
+-- @param owner: Player user ID or global datastore key
+-- @param ver: Version the shards were stored under (see persistKey)
+-- @param fromIndex: First shard index to remove
+-- @param toIndex: Last shard index to remove
+-- @param keyFn: Builds the in-memory key from an index
+-- @param delay: Seconds to wait before deleting (globals: another server may still be loading them)
+local function queueShardRemovals(owner: number | string, ver: (number | string)?, fromIndex: number, toIndex: number, keyFn: (number) -> string, delay: number): ()
+	if toIndex < fromIndex then return end
+
+	local pending = PlayerDatastore.PendingShardRemovals[owner] or {}
+	local due = os.time() + delay
+
+	for index = fromIndex, toIndex do
+		pending[persistKey(keyFn(index), ver)] = due
+	end
+
+	PlayerDatastore.PendingShardRemovals[owner] = pending
+
+	if delay > 0 then
+		task.delay(delay + 1, cleanupPendingShardRemovals, owner)
+	end
+end
+
+-- dropGlobalShardData(): Frees the in-memory shards of the stub currently at a global path
+-- @param path: Global path
+local function dropGlobalShardData(path: string): ()
+	local previous = resolvePath(PlayerDatastore.GlobalData, path)
+	if not isSharded(previous) then return end
+
+	for index = 1, previous.count or 0 do
+		PlayerDatastore.ShardData[getShardGlobalKey(path, index)] = nil
+	end
+end
+
+-- collectShardWrites(): Encodes every shard that needs persisting, and stamps those stubs with the version they will be stored under
 -- @param fields: Configured sharded paths
 -- @param shouldSkip: Returns true for paths owned by another data set
 -- @param getTable: Resolves the in-memory value at a path
--- @param getKey: Builds a persistent shard key from a path and index
--- @return: boolean: Whether every referenced shard was persisted
-local function persistShardFields(
+-- @param getKey: Builds the in-memory shard key from a path and index
+-- @param resolveVer: (path, stub) -> (needsWrite, ver). needsWrite is false when the stub is already persisted
+-- @return: ({ ShardWrite }?, { [string]: any }): Writes (nil if a shard is missing from memory), and every sharded stub seen
+-- @note: Does not yield. Encoding the shards and the master record in one non-yielding block is what stops a concurrent Write from tearing a save
+local function collectShardWrites(
 	fields: { string },
 	shouldSkip: (path: string) -> boolean,
 	getTable: (path: string) -> any,
-	getKey: (path: string, index: number) -> string
-): boolean
+	getKey: (path: string, index: number) -> string,
+	resolveVer: (path: string, stub: any) -> (boolean, (number | string)?)
+): ({ Types.ShardWrite }?, { [string]: any })
+	local writes: { Types.ShardWrite } = {}
+	local stubs: { [string]: any } = {}
+
 	for _, path in fields do
 		if shouldSkip(path) then continue end
-		local field = getTable(path)
-		if not isSharded(field) then continue end
+		local stub = getTable(path)
+		if not isSharded(stub) then continue end
 
-		for index = 1, field.count do
+		stubs[path] = stub
+
+		local needsWrite, ver = resolveVer(path, stub)
+		if not needsWrite then continue end
+
+		stub.ver = ver
+
+		for index = 1, stub.count do
 			local shardKey = getKey(path, index)
 			local shardData = PlayerDatastore.ShardData[shardKey]
 			if not shardData then
-				warn("persistShardFields(): Missing cached shard", shardKey)
-				return false
+				warn("collectShardWrites(): Missing cached shard", shardKey)
+				return nil, stubs
 			end
 
 			local encodedShard = HttpService:JSONEncode(shardData)
 			if #encodedShard > 4 * 1024 * 1024 then
-				error("persistShardFields(): Shard exceeds Roblox 4 MB DataStore limit")
+				error("collectShardWrites(): Shard exceeds Roblox 4 MB DataStore limit")
 			end
 
-			local success = pcall(function()
-				ShardedDataStore:SetAsync(shardKey, encodedShard)
-			end)
-			if not success then
-				warn("persistShardFields(): Failed to persist shard", shardKey)
-				return false
-			end
+			table.insert(writes, { key = persistKey(shardKey, ver), encoded = encodedShard })
+		end
+	end
+
+	return writes, stubs
+end
+
+-- flushShardWrites(): Persists encoded shards (yields)
+-- @param writes: { ShardWrite }
+-- @return: boolean: Whether every shard was persisted
+local function flushShardWrites(writes: { Types.ShardWrite }): boolean
+	for _, write in writes do
+		local success = pcall(function()
+			ShardedDataStore:SetAsync(write.key, write.encoded)
+		end)
+		if not success then
+			warn("flushShardWrites(): Failed to persist shard", write.key)
+			return false
 		end
 	end
 
@@ -951,19 +1013,29 @@ local function saveData(player: Player?, user_id: number?): boolean
 	end
 	if lockStatus == "ERROR" then return false end
 
-	if not persistShardFields(
+	local committed = PlayerDatastore.Committed[userId]
+	if not committed then return false end
+
+	local shardWrites, stubs = collectShardWrites(
 		shardedFields,
 		function(path) return table.find(globalFields, path) ~= nil end,
 		function(path) return resolvePath(data, path) end,
-		function(path, index) return getShardKey(userId, path, index) end
-	) then
-		return false
-	end
+		function(path, index) return getShardKey(userId, path, index) end,
+		function(path, stub)
+			local record = committed[path]
+			if record and record.stub == stub then return false, stub.ver end
+
+			return true, (if record and record.ver == 0 then 1 else 0)
+		end
+	)
+	if not shardWrites then return false end
 
 	local encodedData = HttpService:JSONEncode(data)
 	if #encodedData > 4 * 1024 * 1024 then
 		error("saveData(): Player data payload exceeds Roblox 4 MB DataStore limit")
 	end
+
+	if not flushShardWrites(shardWrites) then return false end
 
 	local success = pcall(function()
 		PlayerDataStore:UpdateAsync(tostring(userId), function(existing: string?): string?
@@ -975,7 +1047,21 @@ local function saveData(player: Player?, user_id: number?): boolean
 		warn("saveData(): Failed to persist player data for", player and player.Name or userId)
 		return false
 	end
-	if not cleanupPendingShardRemovals(userId) then return false end
+
+	for path, stub in stubs do
+		local record = committed[path]
+		if record and record.stub == stub then continue end
+
+		if record then
+			queueShardRemovals(userId, record.ver, if record.ver == nil then 1 else stub.count + 1, record.count, function(index)
+				return getShardKey(userId, path, index)
+			end, 0)
+		end
+
+		committed[path] = { ver = stub.ver, count = stub.count, stub = stub }
+	end
+
+	cleanupPendingShardRemovals(userId)
 
 	return saveMetaData(userId, player and player.Name or tostring(userId))
 end
@@ -1016,8 +1102,9 @@ local function saveGlobalData(): boolean
 
         if table.find(shardedFields, path) and type(value) == "table" then
             if not isSharded(value) then
+				dropGlobalShardData(path)
 				setGlobalField(PlayerDatastore.GlobalData, path, value)
-                PlayerDatastore.ShardGlobal(path, true)
+				PlayerDatastore.ShardGlobal(path, true)
             end
 			dataToSave[path] = resolvePath(PlayerDatastore.GlobalData, path)
         else
@@ -1025,34 +1112,53 @@ local function saveGlobalData(): boolean
         end
     end
 
-	if not persistShardFields(
+	local shardWrites = collectShardWrites(
 		shardedFields,
-		function(path) return table.find(globalFields, path) == nil end,
+		function(path) return dataToSave[path] == nil or table.find(globalFields, path) == nil end,
 		function(path) return resolvePath(PlayerDatastore.GlobalData, path) end,
-		function(path, index) return getShardGlobalKey(path, index) end
-	) then
-		return false
-	end
+		function(path, index) return getShardGlobalKey(path, index) end,
+		function() return true, newGeneration() end
+	)
+	if not shardWrites then return false end
+
+	if not flushShardWrites(shardWrites) then return false end
+
+	local displaced: { { path: string, old: any, new: any } } = {}
 
 	local success = pcall(function()
 		GlobalDataStore:UpdateAsync(Config.DATASTORE.GLOBAL_DATASTORE_KEY, function(encoded: string?): string?
+			table.clear(displaced)
 			local stored = encoded and HttpService:JSONDecode(encoded) or {}
 			stored.__v = stored.__v or {} -- // { [field]: version }; data saved before versioning counts as 0
 			for path, version in versions do
-				if (stored.__v[path] or 0) > version then continue end
+				if (stored.__v[path] or 0) > version then
+					table.insert(displaced, { path = path, old = dataToSave[path], new = stored[path] })
+					continue
+				end
+				table.insert(displaced, { path = path, old = stored[path], new = dataToSave[path] })
 				stored[path] = dataToSave[path]
 				stored.__v[path] = version
 			end
 			PlayerDatastore.StoredGlobalVersions = stored.__v
 			return HttpService:JSONEncode(stored)
 		end)
-    end)
+	end)
 
-    if not success then
+	if not success then
 		warn("saveGlobalData(): Failed to persist global data")
 		return false
 	end
-	if not cleanupPendingShardRemovals(Config.DATASTORE.GLOBAL_DATASTORE_KEY) then return false end
+
+	for _, entry in displaced do
+		local old = entry.old
+		if isSharded(old) and not (isSharded(entry.new) and entry.new.ver == old.ver) then
+			queueShardRemovals(Config.DATASTORE.GLOBAL_DATASTORE_KEY, old.ver, 1, old.count or 0, function(index)
+				return getShardGlobalKey(entry.path, index)
+			end, Config.DATASTORE.GLOBAL_SHARD_REMOVAL_GRACE)
+		end
+	end
+
+	cleanupPendingShardRemovals(Config.DATASTORE.GLOBAL_DATASTORE_KEY)
 
 	return saveGlobalMetaData()
 end
@@ -1105,18 +1211,11 @@ local function syncGlobalFromMemory(liveData: { [string]: any }, globalFields: {
 
 		if value == nil and skipNil then continue end
 
-		local previous = resolvePath(PlayerDatastore.GlobalData, table_path)
-		local oldCount = if isSharded(previous) then previous.count or 0 else 0
+		dropGlobalShardData(table_path)
 		setGlobalField(PlayerDatastore.GlobalData, table_path, value)
 		if value ~= nil then
 			reshardGlobalField(table_path, value, shardedFields)
 		end
-
-		local updated = resolvePath(PlayerDatastore.GlobalData, table_path)
-		local newCount = if isSharded(updated) then updated.count or 0 else 0
-		queueShardRemovals(Config.DATASTORE.GLOBAL_DATASTORE_KEY, oldCount, newCount, function(index)
-			return getShardGlobalKey(table_path, index)
-		end)
 	end
 end
 
@@ -1139,6 +1238,8 @@ local function shardTable(getTbl: () -> { [any]: any }, setTbl: (value: any) -> 
 	end
 
 	if enable then
+		if tbl.__sharded then return end
+
 		local limit = Config.DATASTORE.SHARD_BYTE_LIMIT
 		local shards: { [number]: { [any]: any } } = {}
 		local current: { [any]: any } = {}
@@ -1146,8 +1247,6 @@ local function shardTable(getTbl: () -> { [any]: any }, setTbl: (value: any) -> 
 		local currentBytes = 0
 
 		for k, v in tbl do
-			if k == "__sharded" or k == "count" then continue end
-
 			local addedSize = #HttpService:JSONEncode({ [k] = v })
 
 			if currentBytes + addedSize > limit and next(current) ~= nil then
@@ -1206,6 +1305,28 @@ local function markDirty(key: number | string): ()
 	PlayerDatastore.DirtyData[key] = true
 end
 
+-- saveClaimingDirty(): Saves a player and clears their dirty flag without losing a Write that lands mid-save
+-- @param player: Player
+-- @param userId: number
+-- @return: boolean: Whether everything, including writes that landed mid-save, is persisted
+-- @note: The flag is claimed BEFORE saving. A Write during the save re-marks it, and we save again (bounded) instead of dropping it
+local function saveClaimingDirty(player: Player, userId: number): boolean
+	for _ = 1, 3 do
+		local wasDirty = PlayerDatastore.DirtyData[userId]
+		PlayerDatastore.DirtyData[userId] = nil
+
+		local saved = if wasDirty then saveData(player, userId) else saveMetaData(userId, player.Name)
+		if not saved then
+			markDirty(userId)
+			return false
+		end
+
+		if not PlayerDatastore.DirtyData[userId] then return true end
+	end
+
+	return false
+end
+
 -- flushDirty(): Saves all dirty keys and clears them from DirtyData
 -- @param max_keys: Optional capacity on how many keys to save this cycle (default: all)
 -- @return: number: Amount of keys flushed
@@ -1226,6 +1347,8 @@ local function flushDirty(max_keys: number?): number
 			if not player and PlayerDatastore.SessionLockLost[userId] then
 				PlayerDatastore.PlayerData[userId] = nil
 				PlayerDatastore.MetaData[userId] = nil
+				PlayerDatastore.Committed[userId] = nil
+				PlayerDatastore.PendingShardRemovals[userId] = nil
 				return true
 			end
 			if not saveData(player, userId) then return false end
@@ -1233,6 +1356,8 @@ local function flushDirty(max_keys: number?): number
 				releaseSessionLock(userId)
 				PlayerDatastore.PlayerData[userId] = nil
 				PlayerDatastore.MetaData[userId] = nil
+				PlayerDatastore.Committed[userId] = nil
+				PlayerDatastore.PendingShardRemovals[userId] = nil
 			end
 			return true
 		end,
@@ -1243,8 +1368,10 @@ local function flushDirty(max_keys: number?): number
 	}
 
 	for _, Key in ToProcess do
-		if SaveHandlers[type(Key)](Key) then
-			PlayerDatastore.DirtyData[Key] = nil
+		PlayerDatastore.DirtyData[Key] = nil
+
+		if not SaveHandlers[type(Key)](Key) then
+			PlayerDatastore.DirtyData[Key] = true
 		end
 	end
 
@@ -1432,6 +1559,7 @@ local function onPlayerAdded(player: Player, data_table: { [any]: any }, globalF
 	local initializedShardDefaults = false
 	local shardLoadFailed = false
 	local loadedShardKeys: { string } = {}
+	local committed: { [string]: any } = {}
 
 	for _, table_path in shardedFields do
 		if shardLoadFailed then break end
@@ -1459,7 +1587,7 @@ local function onPlayerAdded(player: Player, data_table: { [any]: any }, globalF
 			local shardKey = getShardKey(player.UserId, table_path, i)
 
 			local success, shardDataOrError = pcall(function()
-				return ShardedDataStore:GetAsync(shardKey)
+				return ShardedDataStore:GetAsync(persistKey(shardKey, tbl.ver))
 			end)
 
 			if not success then
@@ -1484,6 +1612,10 @@ local function onPlayerAdded(player: Player, data_table: { [any]: any }, globalF
 			PlayerDatastore.ShardData[shardKey] = decoded
 			table.insert(loadedShardKeys, shardKey)
 		end
+
+		if not shardLoadFailed then
+			committed[table_path] = { ver = tbl.ver, count = tbl.count, stub = tbl }
+		end
 	end
 
 	if shardLoadFailed then
@@ -1497,6 +1629,8 @@ local function onPlayerAdded(player: Player, data_table: { [any]: any }, globalF
 		cleanupLoadingState(player.UserId)
 		return
 	end
+
+	PlayerDatastore.Committed[player.UserId] = committed
 
 	if initializedShardDefaults then
 		markDirty(player.UserId)
@@ -1575,7 +1709,7 @@ local function onGlobalSetup(data_table: { [any]: any }, globalFields: { string 
 				local shardKey = getShardGlobalKey(table_path, i)
 
 				local success, shardData = pcall(function()
-					return ShardedDataStore:GetAsync(shardKey)
+					return ShardedDataStore:GetAsync(persistKey(shardKey, loadedValue.ver))
 				end)
 
 				if not success then
@@ -1673,6 +1807,7 @@ function PlayerDatastore.Init(data_table: { [any]: any }, presets: Types.PresetO
 
 	local shardedFields: { string } = presets and presets.ShardedFields or {}
 	local globalFields: { string } = presets and presets.GlobalFields or {}
+
 	if not onGlobalSetup(data_table, globalFields, shardedFields) then
 		error("Init(): Global shard load failed; initialization aborted")
 	end
@@ -1688,18 +1823,14 @@ function PlayerDatastore.Init(data_table: { [any]: any }, presets: Types.PresetO
 	Players.PlayerRemoving:Connect(function(player)
 		PlayerDatastore.LoadingPlayers[player.UserId] = nil
 
-		local saved: boolean
-		if PlayerDatastore.DirtyData[player.UserId] then
-			saved = saveData(player, player.UserId)
-		else
-			saved = saveMetaData(player.UserId, player.Name)
-		end
+		local saved = saveClaimingDirty(player, player.UserId)
 
 		if saved then
-			PlayerDatastore.DirtyData[player.UserId] = nil
 			releaseSessionLock(player.UserId)
 			PlayerDatastore.PlayerData[player.UserId] = nil
 			PlayerDatastore.MetaData[player.UserId] = nil
+			PlayerDatastore.Committed[player.UserId] = nil
+			PlayerDatastore.PendingShardRemovals[player.UserId] = nil
 		else
 			markDirty(player.UserId)
 			warn("PlayerRemoving: Retaining unsaved data for retry", player.Name)
@@ -1719,15 +1850,9 @@ function PlayerDatastore.Init(data_table: { [any]: any }, presets: Types.PresetO
 					return
 				end
 
-				local saved: boolean
-				if PlayerDatastore.DirtyData[userId] then
-					saved = saveData(player, userId)
-				else
-					saved = saveMetaData(userId, player.Name)
-				end
+				local saved = saveClaimingDirty(player, userId)
 
 				if saved then
-					PlayerDatastore.DirtyData[userId] = nil
 					releaseSessionLock(userId)
 				else
 					markDirty(userId)
@@ -1898,12 +2023,6 @@ function PlayerDatastore.Write(player: Player, write: Types.WriteType): ()
 
 	if shardedPath then
 		PlayerDatastore.Shard(player, shardedPath, true)
-
-		local newTable = resolvePath(data, shardedPath)
-		local newCount = newTable and newTable.count or 0
-		queueShardRemovals(player.UserId, prevShardCount, newCount, function(index)
-			return getShardKey(player.UserId, shardedPath, index)
-		end)
 	end
 
 	releaseWriteLock(player.UserId)
@@ -1933,19 +2052,25 @@ function PlayerDatastore.DeletePlayerData(player: Player): ()
 			local tbl = resolvePath(data, table_path)
 			if not isSharded(tbl) then continue end
 
-			for i = 1, tbl.count do
+			local record = PlayerDatastore.Committed[user_id] and PlayerDatastore.Committed[user_id][table_path]
+
+			for i = 1, math.max(tbl.count, record and record.count or 0) do
 				local shardKey = getShardKey(user_id, table_path, i)
 				PlayerDatastore.ShardData[shardKey] = nil
 
-				pcall(function()
-					ShardedDataStore:RemoveAsync(shardKey)
-				end)
+				for _, key in { shardKey, persistKey(shardKey, 0), persistKey(shardKey, 1) } do
+					pcall(function()
+						ShardedDataStore:RemoveAsync(key)
+					end)
+				end
 			end
 		end
 	end
 
 	PlayerDatastore.DirtyData[user_id] = nil
 	PlayerDatastore.PlayerData[user_id] = nil
+	PlayerDatastore.Committed[user_id] = nil
+	PlayerDatastore.PendingShardRemovals[user_id] = nil
 	PlayerDatastore.MetaData[user_id] = nil
 
 	pcall(function()
@@ -1983,20 +2108,14 @@ function PlayerDatastore.DeleteGlobalData(path: string): boolean
 		return false
 	end
 
-	local tbl = resolvePath(PlayerDatastore.GlobalData, path)
-
-	if isSharded(tbl) then
-		queueShardRemovals(Config.DATASTORE.GLOBAL_DATASTORE_KEY, tbl.count, 0, function(index)
-			return getShardGlobalKey(path, index)
-		end)
-	end
+	dropGlobalShardData(path)
 
 	setGlobalField(PlayerDatastore.GlobalData, path, nil)
 	PlayerDatastore.MetaData[path] = nil
 
-	markDirty(Config.DATASTORE.GLOBAL_DATASTORE_KEY)
-	if saveGlobalData() then
-		PlayerDatastore.DirtyData[Config.DATASTORE.GLOBAL_DATASTORE_KEY] = nil
+	PlayerDatastore.DirtyData[Config.DATASTORE.GLOBAL_DATASTORE_KEY] = nil
+	if not saveGlobalData() then
+		markDirty(Config.DATASTORE.GLOBAL_DATASTORE_KEY)
 	end
 	return true
 end
@@ -2018,8 +2137,6 @@ function PlayerDatastore.Shard(player: Player, table_path: string, enable: boole
 		warn("Shard(): Couldn't find data for player:", player.Name)
 		return
 	end
-	local previous = resolvePath(data, table_path)
-	local oldCount = if isSharded(previous) then previous.count or 0 else 0
 
 	shardTable(
 		function() return resolvePath(data, table_path) end,
@@ -2028,14 +2145,6 @@ function PlayerDatastore.Shard(player: Player, table_path: string, enable: boole
 		enable,
 		`Shard({table_path})`
 	)
-
-	if enable then
-		local updated = resolvePath(data, table_path)
-		local newCount = if isSharded(updated) then updated.count or 0 else 0
-		queueShardRemovals(player.UserId, oldCount, newCount, function(index)
-			return getShardKey(player.UserId, table_path, index)
-		end)
-	end
 end
 
 -- ShardGlobal(): Enables sharding for a global table path
@@ -2043,8 +2152,6 @@ end
 -- @param enable: Whether to enable sharding
 -- @note: Automatically handles unshard + reshard
 function PlayerDatastore.ShardGlobal(path: string, enable: boolean): ()
-	local previous = resolvePath(PlayerDatastore.GlobalData, path)
-	local oldCount = if isSharded(previous) then previous.count or 0 else 0
 	shardTable(
 		function() return resolvePath(PlayerDatastore.GlobalData, path) end,
 		function(value) setPath(PlayerDatastore.GlobalData, path, value) end,
@@ -2052,14 +2159,6 @@ function PlayerDatastore.ShardGlobal(path: string, enable: boolean): ()
 		enable,
 		`ShardGlobal({path})`
 	)
-
-	if enable then
-		local updated = resolvePath(PlayerDatastore.GlobalData, path)
-		local newCount = if isSharded(updated) then updated.count or 0 else 0
-		queueShardRemovals(Config.DATASTORE.GLOBAL_DATASTORE_KEY, oldCount, newCount, function(index)
-			return getShardGlobalKey(path, index)
-		end)
-	end
 end
 
 --=========================

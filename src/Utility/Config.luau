@@ -18,6 +18,7 @@ return {
 		MEMORY_STORE_KEY = "GlobalMemory", -- // string: Key for MemoryStore to solve global data conflicts
 
 		SHARD_BYTE_LIMIT = 1000000, -- // number: Amount of bytes to intake before starting a new key; (JSON Encoded, Per Char)
+		GLOBAL_SHARD_REMOVAL_GRACE = 120, -- // number: How long a replaced GLOBAL shard version is kept before deletion, so a server that is mid-load of the old master can still finish
 
 		AUTOSAVE_INTERVAL = 30, -- // number: Time in seconds between each autosave
 		MAX_KEYS_PER_AUTOSAVE = 50, -- // number: Max amount of keys to save per autosave
