@@ -7,6 +7,12 @@
       "PlayerDatastore": {
         "$path": "src"
       }
+    },
+
+    "ServerScriptService": {
+      "PlayerDatastoreTests": {
+        "$path":"PlayerDatastoreTests.server.luau"
+      }
     }
   }
 }

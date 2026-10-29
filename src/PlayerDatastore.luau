@@ -71,7 +71,7 @@ local GlobalMemoryStore = MemoryStoreService:GetHashMap(Config.DATASTORE.GLOBAL_
 -- deepClone(): Deep clones a table
 -- @param tbl: The table to clone
 -- @return: { [any]: any }
-local function deepClone(tbl: { any }): any
+local function deepClone(tbl: any): any
 	if type(tbl) ~= "table" then
 		return tbl
 	end
@@ -275,6 +275,8 @@ local function yieldPlayerData(user_id: number): boolean
 	table.insert(PlayerDatastore.LoadingQueues[user_id], coroutine.running()) -- // capturing the current thread per user_id so i don't have to use some hacky while task.wait(...) schema
 	coroutine.yield() -- // suspend user_id thread so everything can be loaded, and i can resume when everything is loaded. same pattern is used in basically everything i need to yield
 
+	task.wait() -- // waiting for 1 hb fixes an issue with yielding where you instantly write after deleting player data
+
 	return PlayerDatastore.PlayerData[user_id] ~= nil
 end
 
@@ -285,6 +287,8 @@ local function yieldGlobalData(): boolean
 
 	table.insert(PlayerDatastore._globalDataWaiters, coroutine.running())
 	coroutine.yield()
+
+	task.wait()
 
 	return PlayerDatastore._initialized
 end
