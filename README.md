@@ -33,6 +33,13 @@ PlayerDatastore.Init({
 	GlobalFields = {
 		"unordered_map"
 	}
+}, {
+	OnRead = function(path: string)
+		print(`Signal: OnRead fired for path: {path}`)
+	end,
+	OnWrite = function(path: string)
+		print(`Signal: OnWrite fired for path: {path}`)
+	end
 })
 ```
 

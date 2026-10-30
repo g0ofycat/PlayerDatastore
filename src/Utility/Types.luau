@@ -40,4 +40,23 @@ export type ShardWrite = { key: string, encoded: string }
 
 export type SessionLockReturnType = "OK" | "CONTESTED" | "ERROR"
 
+export type Connection = {
+	fn: ((...any) -> ())?,
+	sig: Signal,
+	next: Connection?,
+	prev: Connection?
+}
+
+export type Signal = {
+	head: Connection?
+}
+
+export type SignalOperations = {
+	OnRead: (string) -> (),
+	OnWrite: (string) -> (),
+	[string]: string
+}
+
+export type SignalManager = { Signal_R: Signal, Connection_R: Connection, Signal_W: Signal, Connection_W: Connection }
+
 return nil

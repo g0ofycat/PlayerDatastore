@@ -38,6 +38,7 @@ local HttpService = game:GetService("HttpService")
 --=========================
 
 local Config = require("./Utility/Config")
+local Signal = require("./Utility/Signal")
 
 --=========================
 -- // TYPES
@@ -48,6 +49,7 @@ local Types = require("./Utility/Types")
 PlayerDatastore.MetaData = {} :: { [number | string]: Types.MetaData }
 PlayerDatastore.Migrations = {} :: { [string]: { To: string, Fn: Types.MigrationFunction } }
 PlayerDatastore.StoredGlobalVersions = {} :: { [string]: number }
+PlayerDatastore.SignalManager = nil :: Types.SignalManager?
 
 PlayerDatastore.Presets = nil :: Types.PresetOptions?
 
@@ -1801,13 +1803,26 @@ end
 -- Init(): Initialize the datastore handler
 -- @param data_table: { [any]: any }
 -- @param presets: Types.PresetOptions?
-function PlayerDatastore.Init(data_table: { [any]: any }, presets: Types.PresetOptions?): ()
+-- @param signal_ops: Types.SignalOperations?
+function PlayerDatastore.Init(data_table: { [any]: any }, presets: Types.PresetOptions?, signal_ops: Types.SignalOperations?): ()
 	if PlayerDatastore._initialized then
 		warn("Init(): PlayerDatastore is already initialized")
 		return
 	end
 
 	PlayerDatastore.Presets = presets
+
+	if signal_ops then
+		for _, signal_name in signal_ops do
+			local Signal_R = Signal.new()
+			local Connection_R = Signal.connect(Signal_R, signal_ops["OnRead"])
+
+			local Signal_W = Signal.new()
+			local Connection_W = Signal.connect(Signal_W, signal_ops["OnWrite"])
+
+			PlayerDatastore.SignalManager = { Signal_R = Signal_R, Connection_R = Connection_R, Signal_W = Signal_W, Connection_W = Connection_W }
+		end
+	end
 
 	local shardedFields: { string } = presets and presets.ShardedFields or {}
 	local globalFields: { string } = presets and presets.GlobalFields or {}
@@ -1915,6 +1930,10 @@ function PlayerDatastore.Read(player: Player, table_path: string): { [any]: any 
 		return nil
 	end
 
+	if PlayerDatastore.SignalManager then
+		Signal.fire(PlayerDatastore.SignalManager["Signal_R"], table_path)
+	end
+
 	local shardedPath = findShardedPath(data, table_path)
 
 	if shardedPath then
@@ -1967,6 +1986,10 @@ function PlayerDatastore.Write(player: Player, write: Types.WriteType): ()
 		warn("Write(): No data for player:", player.Name, "; write dropped")
 		releaseWriteLock(player.UserId)
 		return
+	end
+
+	if PlayerDatastore.SignalManager then
+		Signal.fire(PlayerDatastore.SignalManager["Signal_W"], write.path)
 	end
 
 	local shardedPath = findShardedPath(data, write.path)
@@ -2175,6 +2198,10 @@ end
 function PlayerDatastore.ReadGlobal(path: string): any
     yieldGlobalData()
 
+	if PlayerDatastore.SignalManager then
+		Signal.fire(PlayerDatastore.SignalManager["Signal_R"], path)
+	end
+
 	local field = matchGlobalField(path)
 	local entry = if field then readMemoryField(field) else nil
 	if not field or not entry then
@@ -2196,6 +2223,10 @@ function PlayerDatastore.WriteGlobal(write: Types.WriteType): boolean
 	if not field then
 		warn("WriteGlobal(): Path doesn't start with a valid global field:", write.path)
 		return false
+	end
+
+	if PlayerDatastore.SignalManager then
+		Signal.fire(PlayerDatastore.SignalManager["Signal_W"], write.path)
 	end
 
 	local success, committed, entry = writeMemoryField(field, function(current): Types.MemoryEntry?
