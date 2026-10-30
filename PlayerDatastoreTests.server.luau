@@ -63,10 +63,12 @@ PlayerDatastore.Init({
 --[[
 print(`--- DELETING ALL DATA... ---`)
 
-PlayerDatastore.DeletePlayerData(FirstCapturedPlayer)
-
 PlayerDatastore.DeleteGlobalData("g_table")
 PlayerDatastore.DeleteGlobalData("sg_table")
+
+PlayerDatastore.DeletePlayerData(FirstCapturedPlayer)
+
+error("Data has been deleted.")
 ]]
 
 -- ==========================
@@ -147,7 +149,7 @@ end})
 -- ==========================
 
 it({ will = "write and read from a global field 'g_table'", should = "contain the updated global data", logic = function()
-    local success = PlayerDatastore.WriteGlobal({
+	local success = PlayerDatastore.WriteGlobal({
         path = "g_table",
         transform = function(currentValue)
             currentValue.GlobalKey = "GlobalValue"

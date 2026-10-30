@@ -2233,7 +2233,7 @@ function PlayerDatastore.WriteGlobal(write: Types.WriteType): boolean
 		local base = {}
 		setGlobalField(base, field, current and current.d)
 
-		local currentValue = resolvePath(base, write.path)
+		local currentValue = PlayerDatastore.GlobalData[write.path]
 		if currentValue == nil then
 			warn("WriteGlobal(): Couldn't find value:", write.path)
 			return nil
