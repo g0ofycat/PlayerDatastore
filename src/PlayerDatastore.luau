@@ -1988,10 +1988,6 @@ function PlayerDatastore.Write(player: Player, write: Types.WriteType): ()
 		return
 	end
 
-	if PlayerDatastore.SignalManager then
-		Signal.fire(PlayerDatastore.SignalManager["Signal_W"], write.path)
-	end
-
 	local shardedPath = findShardedPath(data, write.path)
 	local prevShardCount = 0
 
@@ -2050,6 +2046,10 @@ function PlayerDatastore.Write(player: Player, write: Types.WriteType): ()
 
 	if shardedPath then
 		PlayerDatastore.Shard(player, shardedPath, true)
+	end
+
+	if PlayerDatastore.SignalManager then
+		Signal.fire(PlayerDatastore.SignalManager["Signal_W"], write.path)
 	end
 
 	releaseWriteLock(player.UserId)
@@ -2225,15 +2225,12 @@ function PlayerDatastore.WriteGlobal(write: Types.WriteType): boolean
 		return false
 	end
 
-	if PlayerDatastore.SignalManager then
-		Signal.fire(PlayerDatastore.SignalManager["Signal_W"], write.path)
-	end
-
 	local success, committed, entry = writeMemoryField(field, function(current): Types.MemoryEntry?
 		local base = {}
-		setGlobalField(base, field, current and current.d)
+		local initialData = (current and current.d) or PlayerDatastore.GlobalData[field]
+        setGlobalField(base, field, initialData)
 
-		local currentValue = PlayerDatastore.GlobalData[write.path]
+		local currentValue = resolvePath(base, write.path)
 		if currentValue == nil then
 			warn("WriteGlobal(): Couldn't find value:", write.path)
 			return nil
@@ -2252,6 +2249,11 @@ function PlayerDatastore.WriteGlobal(write: Types.WriteType): boolean
 	syncGlobalFromMemory({ [field] = entry.d }, { field }, shardedFields)
 
 	markDirty(Config.DATASTORE.GLOBAL_DATASTORE_KEY)
+
+	if PlayerDatastore.SignalManager then
+		Signal.fire(PlayerDatastore.SignalManager["Signal_W"], write.path)
+	end
+
 	return true
 end
 

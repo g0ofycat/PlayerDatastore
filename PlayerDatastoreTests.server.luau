@@ -44,9 +44,13 @@ PlayerDatastore.Init({
 	int = 0,
 	string = "",
 	boolean = false,
-	table = {},
+	table = {
+		nested = ""
+	},
 	s_table = {},
-	g_table = {},
+	g_table = {
+		nested = ""
+	},
 	sg_table = {}
 }, {
 	ShardedFields = { "s_table", "sg_table" },
@@ -219,6 +223,32 @@ it({ will = "delete the created snapshot", should = "remove the snapshot from th
     PlayerDatastore.DeleteSnapshot("test-snapshot", FirstCapturedPlayer)
     local snapshots = PlayerDatastore.ListSnapshots(FirstCapturedPlayer)
     assert(snapshots == nil or snapshots["test-snapshot"] == nil, "Expected 'test-snapshot' to be deleted")
+end})
+
+-- ==========================
+-- // 6: NESTED TABLE PATHS
+-- ==========================
+
+it({ will = "read and write from the nested table", should = "successfully read and write nested values", logic = function()
+    PlayerDatastore.Write(FirstCapturedPlayer, {
+        path = "table.nested",
+        transform = function(currentValue)
+            return "NestedValue"
+        end
+    })
+    local val = PlayerDatastore.Read(FirstCapturedPlayer, "table['nested']")
+    assert(val == "NestedValue", "Expected nested value to be 'NestedValue'")
+end})
+
+it({ will = "read and write from the global nested table", should = "successfully read and write nested values", logic = function()
+    PlayerDatastore.WriteGlobal({
+        path = "g_table.nested",
+        transform = function(currentValue)
+            return "NestedValue"
+        end
+    })
+    local val = PlayerDatastore.ReadGlobal('g_table["nested"]')
+    assert(val == "NestedValue", "Expected nested value to be 'NestedValue'")
 end})
 
 print(`--- ALL TESTS PASSED ---`)
